@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[project]
+name = "jax-tvm-ffi"
+version = "0.1.0a0"
+
+license = { text = "Apache 2.0" }
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Education",
+  "Intended Audience :: Science/Research",
+]
+keywords = ["machine learning", "inference"]
+requires-python = ">=3.9"
+
+dependencies = ["jax", "apache-tvm-ffi"]
+
+[build-system]
+requires = ["scikit-build-core>=0.10.0", "apache-tvm-ffi", "jax"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+# the wheel is abi agnostic
+wheel.py-api = "py3"
+minimum-version = "build-system.requires"
+
+# Build configuration
+build-dir = "build"
+build.verbose = true
+
+# CMake configuration
+cmake.version = "CMakeLists.txt"
+cmake.build-type = "RelWithDebugInfo"
+
+# Logging
+logging.level = "INFO"
+
+# Wheel configuration
+wheel.packages = ["python/jax_tvm_ffi"]
+wheel.install-dir = "jax_tvm_ffi"
