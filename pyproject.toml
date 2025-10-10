@@ -15,10 +15,10 @@ classifiers = [
 keywords = ["machine learning", "inference"]
 requires-python = ">=3.9"
 
-dependencies = ["jax", "apache-tvm-ffi"]
+dependencies = ["jax>=0.7.2", "apache-tvm-ffi"]
 
 [build-system]
-requires = ["scikit-build-core>=0.10.0", "apache-tvm-ffi", "jax"]
+requires = ["scikit-build-core>=0.10.0", "apache-tvm-ffi", "jax>=0.7.2"]
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
