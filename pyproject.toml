@@ -41,6 +41,33 @@ logging.level = "INFO"
 wheel.packages = ["python/jax_tvm_ffi"]
 wheel.install-dir = "jax_tvm_ffi"
 
+[tool.cibuildwheel]
+build-verbosity = 1
+
+# Build for Python 3.9-3.12
+# The wheel is abi-agnostic (py3) and will work on newer Python versions
+build = ["cp39-*", "cp310-*", "cp311-*", "cp312-*"]
+skip = ["*musllinux*"]
+
+# We only need to test on cp312 since wheel is abi-agnostic
+test-skip = ["cp39-*", "cp310-*", "cp311-*"]
+
+# Use uv for faster builds
+build-frontend = "build[uv]"
+
+# Run tests after building
+test-command = "pytest {package}/tests -vvs"
+test-requires = ["pytest", "numpy"]
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+
 [tool.ruff]
 include = ["python/**/*.py", "tests/**/*.py"]
 line-length = 100
