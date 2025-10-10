@@ -13,7 +13,7 @@ classifiers = [
   "Intended Audience :: Science/Research",
 ]
 keywords = ["machine learning", "inference"]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 
 dependencies = ["jax>=0.7.2", "apache-tvm-ffi"]
 
@@ -44,13 +44,13 @@ wheel.install-dir = "jax_tvm_ffi"
 [tool.cibuildwheel]
 build-verbosity = 1
 
-# Build for Python 3.9-3.12
+# Build for Python 3.11-3.12
 # The wheel is abi-agnostic (py3) and will work on newer Python versions
-build = ["cp39-*", "cp310-*", "cp311-*", "cp312-*"]
+build = ["cp311-*", "cp312-*"]
 skip = ["*musllinux*"]
 
 # We only need to test on cp312 since wheel is abi-agnostic
-test-skip = ["cp39-*", "cp310-*", "cp311-*"]
+test-skip = ["cp311-*"]
 
 # Use uv for faster builds
 build-frontend = "build[uv]"
