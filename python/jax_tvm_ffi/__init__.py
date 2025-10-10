@@ -34,7 +34,7 @@ _LIB = _load_lib()
 
 
 def _get_dl_device_type(platform: str) -> int:
-    """Get the dl device type from the platform"""
+    """Get the dl device type from the platform."""
     if platform == "cpu":
         return tvm_ffi.DLDeviceType.kDLCPU
     elif platform == "gpu":
@@ -51,7 +51,7 @@ def register_ffi_target(
     *,
     allow_cuda_graph: bool = False,
     pass_owned_tensor: bool = False,
-):
+) -> None:
     """Function to register a ffi target for jax with tvm_ffi.Function
 
     Parameters

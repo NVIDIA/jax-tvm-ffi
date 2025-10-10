@@ -1,0 +1,86 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip_ci_commit: ${{ steps.detect.outputs.should_skip_ci_commit }}
+      should_skip_ci_docs_only: ${{ steps.detect.outputs.should_skip_ci_docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Detect skip ci and docs changes
+        id: detect
+        uses: ./.github/actions/detect-skip-ci
+        with:
+          github_event_name: ${{ github.event_name }}
+          pr_base_ref: ${{ github.event.pull_request.base.ref || '' }}
+          pr_head_sha: ${{ github.event.pull_request.head.sha || '' }}
+
+  lint:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd  # v3.0.1
+
+  test:
+    needs: [lint, prepare]
+    if: >
+      needs.prepare.outputs.should_skip_ci_commit != 'true' &&
+      needs.prepare.outputs.should_skip_ci_docs_only != 'true'
+    name: ${{ matrix.os }} - Python ${{ matrix.python_version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {os: ubuntu-latest, arch: x86_64, python_version: '3.14t'}
+          - {os: ubuntu-24.04-arm, arch: aarch64, python_version: '3.9'}
+          - {os: windows-latest, arch: AMD64, python_version: '3.12'}
+          - {os: macos-14, arch: arm64, python_version: '3.13'}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Print current commit
+        run: git log -1 --oneline
+
+      # Detect CPU count
+      - uses: ./.github/actions/detect-env-vars
+        id: env_vars
+      - name: Print CPU count
+        run: |
+          echo "CPU count: ${{ steps.env_vars.outputs.cpu_count }}"
+
+      # Setup Python with uv
+      - name: Set up Python ${{ matrix.python_version }}
+        uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4  # v6.7.0
+        with:
+          python-version: ${{ matrix.python_version }}
+          activate-environment: true
+
+      # Build and install jax-tvm-ffi
+      - name: Build and install jax-tvm-ffi
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: ${{ steps.env_vars.outputs.cpu_count }}
+        run: |
+          uv pip install pytest numpy
+          uv pip install --reinstall --verbose .
+
+      # Run Python tests
+      - name: Run tests
+        run: |
+          pytest -vvs tests
