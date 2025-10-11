@@ -57,7 +57,7 @@ build-frontend = "build[uv]"
 
 # Run tests after building
 test-command = "pytest {package}/tests -vvs"
-test-requires = ["pytest", "numpy", "ninja"]
+test-requires = ["pytest", "numpy", "apache-tvm-ffi[cpp]"]
 
 [tool.cibuildwheel.linux]
 archs = ["x86_64", "aarch64"]
