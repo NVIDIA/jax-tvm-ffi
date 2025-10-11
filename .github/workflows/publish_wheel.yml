@@ -104,5 +104,6 @@ jobs:
         with:
           attestations: true
           verbose: true
+          skip-existing: true
           # Uncomment to test on TestPyPI first:
           repository-url: https://test.pypi.org/legacy/
