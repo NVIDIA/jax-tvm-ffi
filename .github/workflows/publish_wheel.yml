@@ -10,9 +10,6 @@ on:
         description: "Branch or tag to publish"
         required: true
         default: "main"
-  push:
-    branches:
-      - cj/ci  # Temporary: trigger once to register workflow
 
 jobs:
   build_wheels:
@@ -104,4 +101,4 @@ jobs:
           attestations: true
           verbose: true
           # Uncomment to test on TestPyPI first:
-          repository-url: https://test.pypi.org/legacy/
+          # repository-url: https://test.pypi.org/legacy/
