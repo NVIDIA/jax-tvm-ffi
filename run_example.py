@@ -6,7 +6,7 @@ import jax_tvm_ffi
 import tvm_ffi.cpp
 
 
-def main():
+def main() -> None:
     # create an inline module that defines the function add_one_cpu
     mod: tvm_ffi.Module = tvm_ffi.cpp.load_inline(
         name="hello",
@@ -31,7 +31,7 @@ def main():
 
     # Run the JIT-compiled functions
     @jax.jit
-    def add_one_jax(x):
+    def add_one_jax(x: jnp.ndarray) -> jnp.ndarray:
         """JAX function that calls the 'add_one' C++ implementation."""
         return jax.ffi.ffi_call(
             "example.add_one_cpu",

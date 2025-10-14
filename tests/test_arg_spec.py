@@ -96,7 +96,7 @@ def test_pass_tensor_ret():
     expected_args[0] = x
     expected_args[1] = y
     expected_ret[0] = z
-    ret = jax.ffi.ffi_call(
+    jax.ffi.ffi_call(
         "testing.pass_tensor_ret",
         jax.ShapeDtypeStruct(z.shape, z.dtype),
     )(x, y, eps=eps)

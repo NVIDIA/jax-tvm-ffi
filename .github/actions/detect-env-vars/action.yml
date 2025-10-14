@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Detect Environment Variables
+description: Detects environment variables such as CPU count and sets them as outputs.
+runs:
+  using: "composite"
+  steps:
+    - name: Run Python to detect environment variables
+      shell: python
+      id: detect
+      run: |
+        import multiprocessing, os
+
+        output_file = open(os.environ.get('GITHUB_OUTPUT'), 'a')
+
+        def write_env_var(name, value):
+            output_file.write(f"{name}={value}\n")
+            print(f"Detected environment variable: {name}={value}")
+
+        write_env_var('cpu_count', multiprocessing.cpu_count())
+
+outputs:
+  cpu_count:
+    description: "The number of CPU cores"
+    value: '${{ steps.detect.outputs.cpu_count }}'

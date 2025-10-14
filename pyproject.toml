@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [project]
 name = "jax-tvm-ffi"
-version = "0.1.0a0"
+version = "0.1.0a1"
 
 license = { text = "Apache 2.0" }
 classifiers = [
@@ -13,12 +13,12 @@ classifiers = [
   "Intended Audience :: Science/Research",
 ]
 keywords = ["machine learning", "inference"]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 
-dependencies = ["jax", "apache-tvm-ffi"]
+dependencies = ["jax>=0.7.2", "apache-tvm-ffi"]
 
 [build-system]
-requires = ["scikit-build-core>=0.10.0", "apache-tvm-ffi", "jax"]
+requires = ["scikit-build-core>=0.10.0", "apache-tvm-ffi", "jax>=0.7.2"]
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
@@ -40,3 +40,74 @@ logging.level = "INFO"
 # Wheel configuration
 wheel.packages = ["python/jax_tvm_ffi"]
 wheel.install-dir = "jax_tvm_ffi"
+
+[tool.cibuildwheel]
+build-verbosity = 1
+
+# Build for Python 3.11-3.12
+# The wheel is abi-agnostic (py3) and will work on newer Python versions
+build = ["cp311-*", "cp312-*"]
+skip = ["*musllinux*"]
+
+# We only need to test on cp312 since wheel is abi-agnostic
+test-skip = ["cp311-*"]
+
+# Use uv for faster builds
+build-frontend = "build[uv]"
+
+# Run tests after building
+test-command = "pytest {package}/tests -vvs"
+test-requires = ["pytest", "numpy", "apache-tvm-ffi[cpp]"]
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+repair-wheel-command = "auditwheel repair --exclude libtvm_ffi.so -w {dest_dir} {wheel}"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} {wheel} --exclude libtvm_ffi.dylib --ignore-missing-dependencies"
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+
+[tool.ruff]
+include = ["python/**/*.py", "tests/**/*.py"]
+line-length = 100
+indent-width = 4
+target-version = "py39"
+
+[tool.ruff.lint]
+select = [
+  "UP",  # pyupgrade, https://docs.astral.sh/ruff/rules/#pyupgrade-up
+  "PL",  # pylint, https://docs.astral.sh/ruff/rules/#pylint-pl
+  "I",   # isort, https://docs.astral.sh/ruff/rules/#isort-i
+  "RUF", # ruff, https://docs.astral.sh/ruff/rules/#ruff-specific-rules-ruf
+  "NPY", # numpy, https://docs.astral.sh/ruff/rules/#numpy-specific-rules-npy
+  "F",   # pyflakes, https://docs.astral.sh/ruff/rules/#pyflakes-f
+  "ANN", # flake8-annotations, https://docs.astral.sh/ruff/rules/#flake8-annotations-ann
+  "PTH", # flake8-use-pathlib, https://docs.astral.sh/ruff/rules/#flake8-use-pathlib-pth
+]
+ignore = [
+  "PLR2004", # pylint: magic-value-comparison
+  "ANN401",  # flake8-annotations: any-type
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"] # pyflakes: unused-import
+"tests/*" = [
+  "E741", # pycodestyle: ambiguous-variable-name
+  "ANN",  # flake8-annotations: no type hints required in tests
+]
+
+[tool.ruff.lint.pylint]
+max-args = 10
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = false
+docstring-code-line-length = "dynamic"
