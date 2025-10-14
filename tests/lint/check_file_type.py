@@ -150,24 +150,53 @@ def copyright_line(line: str) -> bool:
     return False
 
 
-def check_asf_copyright(fname: str) -> bool:
-    if fname.endswith(".png"):
-        return True
-    if not Path(fname).is_file():
-        return True
-    has_spdx_header = False
-    has_copyright = False
+def check_spdx_header(fname: str) -> tuple[bool, str]:
+    """Check if file has proper SPDX header.
+
+    Returns:
+        (bool, str): (passes_check, error_message)
+    """
+    # Skip binary files, directories, and special files
+    skip_files = {
+        ".gitignore",
+        ".gitattributes",
+        ".clang-format",
+        ".clang-tidy",
+        "LICENSE",
+        "NOTICE",
+        "README.md",
+        "CONTRIBUTING.md",
+    }
+    if (
+        fname.endswith((".png", ".whl"))
+        or not Path(fname).is_file()
+        or Path(fname).name in skip_files
+    ):
+        return (True, "")
+
+    has_spdx_copyright = False
+    has_spdx_license = False
+    has_separate_copyright = False
+
     try:
         for line in Path(fname).open():
+            if line.find("SPDX-FileCopyrightText") != -1:
+                has_spdx_copyright = True
             if line.find("SPDX-License-Identifier") != -1:
-                has_spdx_header = True
+                has_spdx_license = True
             if copyright_line(line):
-                has_copyright = True
-            if has_spdx_header and has_copyright:
-                return False
+                has_separate_copyright = True
     except UnicodeDecodeError:
-        pass
-    return True
+        # Skip binary files
+        return (True, "")
+
+    # Check for issues
+    if not has_spdx_copyright or not has_spdx_license:
+        return (False, "missing SPDX header")
+    if has_separate_copyright:
+        return (False, "has SPDX header AND separate copyright line")
+
+    return (True, "")
 
 
 def main() -> None:
@@ -196,24 +225,25 @@ def main() -> None:
         sys.stderr.flush()
         sys.exit(-1)
 
-    asf_copyright_list = []
+    spdx_issues = {}
 
     for fname in res.split():
-        if not check_asf_copyright(fname):
-            asf_copyright_list.append(fname)
+        passes, error_msg = check_spdx_header(fname)
+        if not passes:
+            spdx_issues[fname] = error_msg
 
-    if asf_copyright_list:
-        report = "------File type check report----\n"
-        report += "\n".join(asf_copyright_list) + "\n"
-        report += f"------Found {len(asf_copyright_list)} files that has ASF header with copyright message----\n"
-        report += "--- Files with ASF header do not need Copyright lines.\n"
-        report += "--- Contributors retain copyright to their contribution by default.\n"
-        report += "--- If a file comes with a different license, consider put it under the 3rdparty folder instead.\n"
+    if spdx_issues:
+        report = "------SPDX Header Check Report----\n"
+        report += f"Found {len(spdx_issues)} files with header issues:\n\n"
+        for fname, error in spdx_issues.items():
+            report += f"  {fname}: {error}\n"
+        report += "\n"
+        report += "--- All source files must have SPDX headers:\n"
+        report += "---   # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n"
+        report += "---   # SPDX-License-Identifier: Apache-2.0\n"
         report += "---\n"
-        report += "--- You can use the following steps to remove the copyright lines\n"
-        report += "--- Create file_list.txt in your text editor\n"
-        report += "--- Copy paste the above content in file-list into file_list.txt\n"
-        report += "--- python3 tests/lint/add_asf_header.py file_list.txt\n"
+        report += "--- Files with SPDX headers should not have separate copyright lines.\n"
+        report += "--- SPDX-FileCopyrightText already includes copyright information.\n"
         sys.stderr.write(report)
         sys.stderr.flush()
         sys.exit(-1)
