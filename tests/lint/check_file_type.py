@@ -1,19 +1,5 @@
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Helper tool to check file types that are allowed to checkin."""
 
 import subprocess
@@ -150,6 +136,9 @@ def filename_allowed(name: str) -> bool:
 
 
 def copyright_line(line: str) -> bool:
+    # SPDX headers include copyright, so exclude them from this check
+    if line.find("SPDX-FileCopyrightText") != -1:
+        return False
     # Following two items are intentionally break apart
     # so that the copyright detector won't detect the file itself.
     if line.find("Copyright " + "(c)") != -1:
@@ -166,15 +155,15 @@ def check_asf_copyright(fname: str) -> bool:
         return True
     if not Path(fname).is_file():
         return True
-    has_asf_header = False
+    has_spdx_header = False
     has_copyright = False
     try:
         for line in Path(fname).open():
-            if line.find("Licensed to the Apache Software Foundation") != -1:
-                has_asf_header = True
+            if line.find("SPDX-License-Identifier") != -1:
+                has_spdx_header = True
             if copyright_line(line):
                 has_copyright = True
-            if has_asf_header and has_copyright:
+            if has_spdx_header and has_copyright:
                 return False
     except UnicodeDecodeError:
         pass
