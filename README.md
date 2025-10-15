@@ -45,7 +45,7 @@ mod = tvm_ffi.cpp.load_inline(
             TVM_FFI_ICHECK(y.dtype() == f32_dtype) << "y must be a float tensor";
             TVM_FFI_ICHECK(x.size(0) == y.size(0)) << "x and y must have the same shape";
             for (int i = 0; i < x.size(0); ++i) {
-            static_cast<float*>(y.data_ptr())[i] = static_cast<float*>(x.data_ptr())[i] + 1;
+              static_cast<float*>(y.data_ptr())[i] = static_cast<float*>(x.data_ptr())[i] + 1;
             }
         }
     """,
