@@ -88,8 +88,6 @@ def register_ffi_target(
 
     """
     platform = {"cuda": "gpu"}.get(platform, platform)
-    if platform not in ("cpu", "gpu"):
-        raise ValueError(f"Unsupported platform: {platform}")
     # by default, we use the arg spec "args" and "rets"
     arg_spec = arg_spec if arg_spec is not None else ["args", "rets"]
     dl_device_type = _get_dl_device_type(platform)
