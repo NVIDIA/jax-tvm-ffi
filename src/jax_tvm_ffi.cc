@@ -22,7 +22,9 @@ enum class DecodeKind {
   // place all the returns here
   kRets,
   // place one attribute value here
-  kAttrValue
+  kAttrValue,
+  // place the CUDA/platform stream as int64_t here
+  kContextStream
 };
 
 // Decode Item used to decode a call frame into the call stack
@@ -60,13 +62,15 @@ DecodeSpec ParseArgSpec(tvm::ffi::Array<tvm::ffi::String> arg_spec) {
       items.push_back(DecodeItem{DecodeKind::kArgs, 0});
     } else if (spec_item == "rets") {
       items.push_back(DecodeItem{DecodeKind::kRets, 0});
+    } else if (spec_item == "ctx.stream") {
+      items.push_back(DecodeItem{DecodeKind::kContextStream, 0});
     } else if (spec_item.compare(0, 6, "attrs.") == 0) {
       std::string attr_key = spec_item.substr(6);
       items.push_back(DecodeItem{DecodeKind::kAttrValue, 0});
       attr_keys.push_back(std::make_pair(attr_key, i));
     } else {
       TVM_FFI_THROW(RuntimeError) << "Invalid arg spec: " << spec_item
-                                  << ". Expected 'args', 'rets', or 'attrs.<key>'";
+                                  << ". Expected 'args', 'rets', 'ctx.stream', or 'attrs.<key>'";
     }
   }
   // sort the attributes by their names
@@ -448,6 +452,13 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
           }
           break;
         }
+        case DecodeKind::kContextStream: {
+          if (XLA_FFI_Error* err = DecodeContextStream(&call_ctx);  //
+              XLA_FFI_PREDICT_FALSE(err)) {
+            return err;
+          }
+          break;
+        }
         default: {
           return MakeError(call_frame->api, XLA_FFI_Error_Code_INTERNAL, "Invalid decode kind");
         }
@@ -603,6 +614,15 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
         call_ctx->stack->packed_args.emplace_back(call_ctx->stack->AllocTempOwnedTensor(dltensor));
       }
     }
+    return Success();
+  }
+
+  XLA_FFI_Error* DecodeContextStream(CallContext* call_ctx) const {
+    // Convert void* stream pointer to int64_t and add to packed args.
+    // This allows functions to explicitly receive the CUDA/platform stream if they include
+    // "ctx.stream" in their arg_spec.
+    int64_t stream_as_int64 = reinterpret_cast<int64_t>(call_ctx->stream);
+    call_ctx->stack->packed_args.emplace_back(stream_as_int64);
     return Success();
   }
 
