@@ -51,22 +51,22 @@ def main() -> None:
               TVM_FFI_ICHECK(stream != 0) << "GPU stream should be non-zero";
 
               // Validate inputs
-              TVM_FFI_ICHECK(x->ndim == 1) << "x must be 1D";
-              TVM_FFI_ICHECK(y->ndim == 1) << "y must be 1D";
-              TVM_FFI_ICHECK(out->ndim == 1) << "out must be 1D";
-              TVM_FFI_ICHECK(x->shape[0] == y->shape[0]) << "x and y must have same shape";
-              TVM_FFI_ICHECK(x->shape[0] == out->shape[0]) << "out must have same shape";
+              TVM_FFI_ICHECK(x.ndim() == 1) << "x must be 1D";
+              TVM_FFI_ICHECK(y.ndim() == 1) << "y must be 1D";
+              TVM_FFI_ICHECK(out.ndim() == 1) << "out must be 1D";
+              TVM_FFI_ICHECK(x.size(0) == y.size(0)) << "x and y must have same shape";
+              TVM_FFI_ICHECK(x.size(0) == out.size(0)) << "out must have same shape";
 
-              int n = x->shape[0];
+              int n = x.size(0);
               int threads = 256;
               int blocks = (n + threads - 1) / threads;
 
               // Launch kernel on the stream provided by JAX
               cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
               vector_add_kernel<<<blocks, threads, 0, cuda_stream>>>(
-                static_cast<const float*>(x->data),
-                static_cast<const float*>(y->data),
-                static_cast<float*>(out->data),
+                static_cast<const float*>(x.data_ptr()),
+                static_cast<const float*>(y.data_ptr()),
+                static_cast<float*>(out.data_ptr()),
                 n
               );
 

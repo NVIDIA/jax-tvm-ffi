@@ -118,23 +118,23 @@ def test_ctx_stream_inline_cuda_kernel():
               printf("Received GPU stream pointer: %lld (0x%llx)\n", (long long)stream, (unsigned long long)stream);
 
               TVM_FFI_ICHECK(stream != 0) << "GPU stream should be non-zero";
-              TVM_FFI_ICHECK(x->ndim == 1) << "x must be a 1D tensor";
-              TVM_FFI_ICHECK(y->ndim == 1) << "y must be a 1D tensor";
-              TVM_FFI_ICHECK(x->shape[0] == y->shape[0]) << "x and y must have the same shape";
+              TVM_FFI_ICHECK(x.ndim() == 1) << "x must be a 1D tensor";
+              TVM_FFI_ICHECK(y.ndim() == 1) << "y must be a 1D tensor";
+              TVM_FFI_ICHECK(x.size(0) == y.size(0)) << "x and y must have the same shape";
 
               DLDataType f32_dtype{kDLFloat, 32, 1};
-              TVM_FFI_ICHECK(x->dtype == f32_dtype) << "x must be a float tensor";
-              TVM_FFI_ICHECK(y->dtype == f32_dtype) << "y must be a float tensor";
+              TVM_FFI_ICHECK(x.dtype() == f32_dtype) << "x must be a float tensor";
+              TVM_FFI_ICHECK(y.dtype() == f32_dtype) << "y must be a float tensor";
 
               // Launch CUDA kernel using the provided stream
-              int n = x->shape[0];
+              int n = x.size(0);
               int threads = 256;
               int blocks = (n + threads - 1) / threads;
 
               cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
               add_one_kernel<<<blocks, threads, 0, cuda_stream>>>(
-                static_cast<const float*>(x->data),
-                static_cast<float*>(y->data),
+                static_cast<const float*>(x.data_ptr()),
+                static_cast<float*>(y.data_ptr()),
                 n
               );
             }

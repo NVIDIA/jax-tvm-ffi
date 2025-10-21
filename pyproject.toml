@@ -15,10 +15,10 @@ classifiers = [
 keywords = ["machine learning", "inference"]
 requires-python = ">=3.11"
 
-dependencies = ["jax>=0.7.2", "apache-tvm-ffi"]
+dependencies = ["jax>=0.7.2", "apache-tvm-ffi>=0.1.0"]
 
 [build-system]
-requires = ["scikit-build-core>=0.10.0", "apache-tvm-ffi", "jax>=0.7.2"]
+requires = ["scikit-build-core>=0.10.0", "apache-tvm-ffi>=0.1.0", "jax>=0.7.2"]
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
@@ -57,7 +57,7 @@ build-frontend = "build[uv]"
 
 # Run tests after building
 test-command = "pytest {package}/tests -vvs"
-test-requires = ["pytest", "numpy", "apache-tvm-ffi[cpp]"]
+test-requires = ["pytest", "numpy", "apache-tvm-ffi[cpp]>=0.1.0"]
 
 [tool.cibuildwheel.linux]
 archs = ["x86_64", "aarch64"]
