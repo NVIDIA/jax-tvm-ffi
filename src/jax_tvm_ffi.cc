@@ -102,18 +102,23 @@ class CallContext {
     TVM_FFI_INLINE void ReserveTempDLTensors(size_t num_args, size_t num_rets) {
       temp_dltensors_.resize(num_args + num_rets);
       dltensor_total_ndims_ = 0;
+      dltensor_fp4_total_ndims_ = 0;
       dltensor_alloc_count_ = 0;
     }
 
     /*!
      * \brief Allocate a temp DLTensor
      * \param ndim The number of dimensions of the DLTensor
+     * \param need_fp4_packing Whether this is an FP4 tensor that needs shape transformation
      * \return The allocated DLTensor
      */
-    TVM_FFI_INLINE DLTensor* AllocTempDLTensor(size_t ndim) {
+    TVM_FFI_INLINE DLTensor* AllocTempDLTensor(size_t ndim, bool need_fp4_packing = false) {
       // invariance, this should never happen as we reserve the workspace in advance
       TVM_FFI_ICHECK_LT(dltensor_alloc_count_, temp_dltensors_.size());
       dltensor_total_ndims_ += ndim;
+      if (need_fp4_packing) {
+        dltensor_fp4_total_ndims_ += ndim;
+      }
       return &temp_dltensors_[dltensor_alloc_count_++];
     }
 
@@ -128,6 +133,32 @@ class CallContext {
             tvm::ffi::ShapeView(temp_dltensors_[i].shape, temp_dltensors_[i].ndim),
             temp_dltensors_[i].strides);
         strides_begin += temp_dltensors_[i].ndim;
+      }
+    }
+
+    /*!
+     * \brief Fill shapes for FP4 tensors that need shape transformation
+     * \note This must be called before FillStridesForTempDLTensors since strides
+     *       computation depends on the (potentially modified) shape.
+     */
+    TVM_FFI_INLINE void FillShapesForFP4Tensors() {
+      if (dltensor_fp4_total_ndims_ == 0) return;  // No FP4 tensors, nothing to do
+
+      temp_shapes_.resize(dltensor_fp4_total_ndims_);
+      size_t shape_begin = 0;
+
+      for (size_t i = 0; i < dltensor_alloc_count_; ++i) {
+        // Check if this is an FP4 tensor (4-bit float with 2 elements per byte)
+        if (temp_dltensors_[i].dtype.code == kDLFloat4_e2m1fn) {
+          const int64_t* orig_shape = temp_dltensors_[i].shape;
+          const int64_t ndim = temp_dltensors_[i].ndim;
+          std::memcpy(&temp_shapes_[shape_begin], orig_shape, sizeof(int64_t) * ndim);
+          if (ndim > 0) {
+            temp_shapes_[shape_begin + ndim - 1] = (orig_shape[ndim - 1] + 1) / 2;
+          }
+          temp_dltensors_[i].shape = temp_shapes_.data() + shape_begin;
+          shape_begin += ndim;
+        }
       }
     }
     /*!
@@ -185,10 +216,16 @@ class CallContext {
      *       It will be set after DLTensors are decoded.
      */
     std::vector<int64_t> temp_strides_;
+    /*! \brief The workspace for transformed shapes (e.g., FP4 packing)
+     * \note This is used to store transformed shapes when dtype translation is needed.
+     */
+    std::vector<int64_t> temp_shapes_;
     /*! \brief The number of DLTensors */
     size_t dltensor_alloc_count_ = 0;
     /*! \brief Total number of ndims needed for the DLTensors */
     size_t dltensor_total_ndims_ = 0;
+    /*! \brief Total number of ndims needed for FP4 tensors only */
+    size_t dltensor_fp4_total_ndims_ = 0;
 
     friend class CallContext;
   };
@@ -213,6 +250,7 @@ class CallContext {
     stack->temp_owned_tensors_.clear();
     stack->temp_dltensors_.clear();
     stack->temp_strides_.clear();
+    stack->temp_shapes_.clear();
   }
 
  private:
@@ -288,8 +326,7 @@ TVM_FFI_INLINE std::optional<DLDataType> DecodeDataType(XLA_FFI_DataType dtype) 
       return DLDataType{kDLFloat8_e8m0fnu, 8, 1};
     }
     case XLA_FFI_DataType_F4E2M1FN: {
-      // TODO(jax-tvm-ffi team): confirm XLA laytout of F4E2M1FN
-      return DLDataType{kDLFloat4_e2m1fn, 4, 1};
+      return DLDataType{kDLFloat4_e2m1fn, 4, 2};
     }
     default: {
       return std::nullopt;
@@ -464,6 +501,8 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
         }
       }
     }
+    // fill in shapes for FP4 tensors
+    call_ctx.stack->FillShapesForFP4Tensors();
     // fill in strides for the temp DLTensors
     call_ctx.stack->FillStridesForTempDLTensors();
     // now run the invocation
@@ -558,7 +597,8 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
   TVM_FFI_INLINE XLA_FFI_Error* DecodeBuffer(const XLA_FFI_CallFrame* call_frame,
                                              CallContext* call_ctx, XLA_FFI_Buffer* buffer,
                                              DLTensor** target) const {
-    DLTensor* dltensor = call_ctx->stack->AllocTempDLTensor(buffer->rank);
+    DLTensor* dltensor = call_ctx->stack->AllocTempDLTensor(
+        buffer->rank, (buffer->dtype == XLA_FFI_DataType_F4E2M1FN));
     dltensor->data = buffer->data;
     dltensor->device = call_ctx->device;
     if (auto dtype = DecodeDataType(buffer->dtype); XLA_FFI_PREDICT_TRUE(dtype)) {
