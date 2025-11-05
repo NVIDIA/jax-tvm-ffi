@@ -6,21 +6,9 @@ import jax
 import jax.numpy as jnp
 import jax_tvm_ffi
 import numpy
-import pytest
 import tvm_ffi
 import tvm_ffi.cpp
-
-
-def _has_gpu() -> bool:
-    """Check if GPU is available without raising an exception."""
-    try:
-        return len(jax.devices("gpu")) > 0
-    except RuntimeError:
-        return False
-
-
-# Create a pytest marker
-requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="Test requires a GPU")
+from conftest import requires_gpu
 
 
 @requires_gpu

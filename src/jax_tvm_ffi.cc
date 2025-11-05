@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 #include <dlpack/dlpack.h>
+#include <tvm/ffi/c_api.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/c_env_api.h>
@@ -26,6 +27,97 @@ enum class DecodeKind {
   // place the CUDA/platform stream as int64_t here
   kContextStream
 };
+
+/*!
+ * \brief Context for workspace allocator
+ * This allocator carves chunks from a pre-allocated XLA workspace buffer to satisfy tvm-ffi
+ * TVMFFIEnvGetDLPackManagedTensorAllocator() calls without dynamic CUDA allocation.
+ */
+struct WorkspaceAllocatorContext {
+  /*! \brief Base pointer of the workspace buffer from XLA */
+  void* base_ptr;
+  /*! \brief Total capacity of the workspace buffer in bytes */
+  size_t capacity_bytes;
+  /*! \brief Current offset into the workspace buffer */
+  size_t offset_bytes;
+  /*! \brief Peak usage during this call */
+  size_t peak_used_bytes;
+  /*! \brief Device where the workspace resides */
+  DLDevice device;
+
+  WorkspaceAllocatorContext(void* base, size_t capacity, DLDevice dev)
+      : base_ptr(base),
+        capacity_bytes(capacity),
+        offset_bytes(0),
+        peak_used_bytes(0),
+        device(dev) {}
+
+  /*! \brief Compute size needed for a DLTensor prototype */
+  static size_t ComputeTensorSize(const DLTensor* prototype) {
+    size_t numel = 1;
+    for (int i = 0; i < prototype->ndim; ++i) {
+      numel *= prototype->shape[i];
+    }
+    size_t bits = prototype->dtype.bits * prototype->dtype.lanes;
+    return (numel * bits + 7) / 8;  // Convert bits to bytes
+  }
+};
+
+/*! \brief Thread-local workspace context (set during handler call) */
+static thread_local WorkspaceAllocatorContext* g_workspace_ctx = nullptr;
+
+/*! \brief Peak workspace usage from last call (for calibration) */
+static thread_local size_t g_last_workspace_peak = 0;
+
+/*!
+ * \brief DLPackManagedTensorAllocator callback that carves from workspace
+ * This function is called when TVM-FFI TVMFFIEnvGetDLPackManagedTensorAllocator() is used.
+ */
+int WorkspaceAllocatorCallback(DLTensor* prototype, DLManagedTensorVersioned** out, void* error_ctx,
+                               void (*SetError)(void* error_ctx, const char* kind,
+                                                const char* message)) {
+  WorkspaceAllocatorContext* ctx = g_workspace_ctx;
+  if (ctx == nullptr) {
+    SetError(error_ctx, "RuntimeError", "WorkspaceAllocatorContext not set");
+    return -1;
+  }
+
+  size_t size = WorkspaceAllocatorContext::ComputeTensorSize(prototype);
+
+  // Apply 128-byte alignment
+  constexpr size_t ALIGNMENT = 128;
+  size_t aligned_offset = (ctx->offset_bytes + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+
+  if (aligned_offset + size > ctx->capacity_bytes) {
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "Workspace overflow: requested %zu bytes (aligned), available %zu bytes "
+             "(capacity %zu, offset %zu, aligned_offset %zu)",
+             size, ctx->capacity_bytes - aligned_offset, ctx->capacity_bytes, ctx->offset_bytes,
+             aligned_offset);
+    SetError(error_ctx, "RuntimeError", msg);
+    return -1;
+  }
+
+  void* data_ptr = static_cast<char*>(ctx->base_ptr) + aligned_offset;
+  ctx->offset_bytes = aligned_offset + size;
+  ctx->peak_used_bytes = std::max(ctx->peak_used_bytes, ctx->offset_bytes);
+
+  *out = new DLManagedTensorVersioned();
+  (*out)->version.major = DLPACK_MAJOR_VERSION;
+  (*out)->version.minor = DLPACK_MINOR_VERSION;
+  (*out)->flags = 0;
+
+  (*out)->dl_tensor = *prototype;
+  (*out)->dl_tensor.data = data_ptr;
+  (*out)->dl_tensor.byte_offset = 0;
+
+  // Deleter is no-op since XLA owns the backing workspace memory
+  (*out)->manager_ctx = nullptr;
+  (*out)->deleter = [](DLManagedTensorVersioned* self) { delete self; };
+
+  return 0;
+}
 
 // Decode Item used to decode a call frame into the call stack
 struct DecodeItem {
@@ -434,12 +526,13 @@ TVM_FFI_INLINE std::optional<tvm::ffi::Any> DecodeAttrArray(XLA_FFI_Array* array
 class JAXTVMFFIHandler : public xla::ffi::Ffi {
  public:
   JAXTVMFFIHandler(tvm::ffi::Function func, DecodeSpec decode_spec, int device_type, int traits,
-                   bool pass_owned_tensor)
+                   bool pass_owned_tensor, bool require_workspace)
       : func_(func),
         decode_spec_(decode_spec),
         device_type_(device_type),
         traits_(traits),
-        pass_owned_tensor_(pass_owned_tensor) {}
+        pass_owned_tensor_(pass_owned_tensor),
+        require_workspace_(require_workspace) {}
 
   XLA_FFI_Error* Call(XLA_FFI_CallFrame* call_frame) const final {
     // If passed a call frame with the metadata extension, just return the
@@ -505,6 +598,35 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
     call_ctx.stack->FillShapesForFP4Tensors();
     // fill in strides for the temp DLTensors
     call_ctx.stack->FillStridesForTempDLTensors();
+
+    // Check for workspace (flag set at registration time)
+    // Setup custom allocator to carve from XLA's pre-allocated workspace
+    WorkspaceAllocatorContext* workspace_ctx = nullptr;
+    DLPackManagedTensorAllocator prev_allocator = nullptr;
+
+    if (require_workspace_ && call_frame->rets.size > 0) {
+      // Convention: workspace is always the last return buffer
+      XLA_FFI_Buffer* last_ret =
+          static_cast<XLA_FFI_Buffer*>(call_frame->rets.rets[call_frame->rets.size - 1]);
+      size_t workspace_size = last_ret->dims[0];
+      workspace_ctx =
+          new WorkspaceAllocatorContext(last_ret->data, workspace_size, call_ctx.device);
+      g_workspace_ctx = workspace_ctx;
+
+      int ret_code =
+          TVMFFIEnvSetDLPackManagedTensorAllocator(WorkspaceAllocatorCallback,
+                                                   /*write_to_global=*/0, &prev_allocator);
+      if (XLA_FFI_PREDICT_FALSE(ret_code != 0)) {
+        delete workspace_ctx;
+        g_workspace_ctx = nullptr;
+        return MakeError(call_frame->api, XLA_FFI_Error_Code_INTERNAL,
+                         "Failed to set workspace allocator");
+      }
+    } else {
+      // Reset peak for non-workspace calls to avoid stale values
+      g_last_workspace_peak = 0;
+    }
+
     // now run the invocation
     // use C safe call so that we don't have to catch an exception
     void* prev_stream = nullptr;
@@ -512,6 +634,11 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
       int ret_code = TVMFFIEnvSetStream(call_ctx.device.device_type, call_ctx.device.device_id,
                                         call_ctx.stream, &prev_stream);
       if (XLA_FFI_PREDICT_FALSE(ret_code != 0)) {
+        if (require_workspace_) {
+          TVMFFIEnvSetDLPackManagedTensorAllocator(prev_allocator, 0, nullptr);
+          delete workspace_ctx;
+          g_workspace_ctx = nullptr;
+        }
         return MoveFromSafeCallRaisedToXLAError(call_frame, XLA_FFI_Error_Code_INTERNAL);
       }
     }
@@ -523,13 +650,39 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
                             reinterpret_cast<const TVMFFIAny*>(call_ctx.stack->packed_args.data()),
                             static_cast<int32_t>(call_ctx.stack->packed_args.size()),
                             reinterpret_cast<TVMFFIAny*>(&result));
-    // restore the stream regardless of the result of the call
+
+    int workspace_cleanup_failed = 0;
+    if (require_workspace_) {
+      int ret_code = TVMFFIEnvSetDLPackManagedTensorAllocator(prev_allocator, 0, nullptr);
+      g_workspace_ctx = nullptr;
+      g_last_workspace_peak = workspace_ctx->peak_used_bytes;
+
+      if (const char* debug = std::getenv("JAX_TVM_FFI_DEBUG_WORKSPACE")) {
+        if (debug[0] == '1') {
+          fprintf(stderr, "[JAX-TVM-FFI] Workspace: %zu / %zu bytes (%.1f%%)\n",
+                  workspace_ctx->peak_used_bytes, workspace_ctx->capacity_bytes,
+                  100.0 * workspace_ctx->peak_used_bytes / workspace_ctx->capacity_bytes);
+        }
+      }
+
+      delete workspace_ctx;
+
+      if (XLA_FFI_PREDICT_FALSE(ret_code != 0)) {
+        workspace_cleanup_failed = 1;
+      }
+    }
+
+    // Always restore stream before returning (even if workspace cleanup failed)
     if (prev_stream != nullptr && prev_stream != call_ctx.stream) {
       int ret_code = TVMFFIEnvSetStream(call_ctx.device.device_type, call_ctx.device.device_id,
                                         prev_stream, nullptr);
       if (XLA_FFI_PREDICT_FALSE(ret_code != 0)) {
         return MoveFromSafeCallRaisedToXLAError(call_frame, XLA_FFI_Error_Code_INTERNAL);
       }
+    }
+
+    if (XLA_FFI_PREDICT_FALSE(workspace_cleanup_failed)) {
+      return MoveFromSafeCallRaisedToXLAError(call_frame, XLA_FFI_Error_Code_INTERNAL);
     }
     if (XLA_FFI_PREDICT_FALSE(call_code != 0)) {
       return MoveFromSafeCallRaisedToXLAError(call_frame, XLA_FFI_Error_Code_INTERNAL);
@@ -638,7 +791,13 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
   }
 
   XLA_FFI_Error* DecodeRets(const XLA_FFI_CallFrame* call_frame, CallContext* call_ctx) const {
-    for (int64_t i = 0; i < call_frame->rets.size; ++i) {
+    // If require_workspace is true, skip the last buffer (which is the workspace)
+    int64_t num_rets_to_decode = call_frame->rets.size;
+    if (require_workspace_ && num_rets_to_decode > 0) {
+      num_rets_to_decode -= 1;
+    }
+
+    for (int64_t i = 0; i < num_rets_to_decode; ++i) {
       if (XLA_FFI_PREDICT_FALSE(call_frame->rets.types[i] != XLA_FFI_RetType_BUFFER)) {
         return InvalidArgument(call_frame->api, "Only support AnyBuffer return type");
       }
@@ -780,6 +939,7 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
   int device_type_;
   int traits_;
   bool pass_owned_tensor_;
+  bool require_workspace_;
 };
 
 //-------------------------------------------------------------------
@@ -787,8 +947,10 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
 class JAXTVMFFIRegistry {
  public:
   static void* Register(tvm::ffi::Function func, tvm::ffi::Array<tvm::ffi::String> arg_spec,
-                        int device_type, int traits, bool pass_owned_tensor) {
-    return Global()->RegisterInternal(func, arg_spec, device_type, traits, pass_owned_tensor);
+                        int device_type, int traits, bool pass_owned_tensor,
+                        bool require_workspace) {
+    return Global()->RegisterInternal(func, arg_spec, device_type, traits, pass_owned_tensor,
+                                      require_workspace);
   }
 
   static size_t RegisteredCount() { return Global()->registered_count_; }
@@ -812,13 +974,14 @@ class JAXTVMFFIRegistry {
 
   // internal register function
   void* RegisterInternal(tvm::ffi::Function func, tvm::ffi::Array<tvm::ffi::String> arg_spec,
-                         int device_type, int traits, bool pass_owned_tensor) {
+                         int device_type, int traits, bool pass_owned_tensor,
+                         bool require_workspace) {
     if (registered_count_ >= kTrampolineTableSize) {
       TVM_FFI_THROW(RuntimeError) << "JAXTVMFFIRegistry: cannot register more than "
                                   << kTrampolineTableSize << " handlers";
     }
     handler_table_[registered_count_++] = std::make_unique<JAXTVMFFIHandler>(
-        func, ParseArgSpec(arg_spec), device_type, traits, pass_owned_tensor);
+        func, ParseArgSpec(arg_spec), device_type, traits, pass_owned_tensor, require_workspace);
     return reinterpret_cast<void*>(trampoline_table_[registered_count_ - 1]);
   }
 
@@ -849,9 +1012,11 @@ class JAXTVMFFIRegistry {
   }
 };
 
-// callback to register a handler to the global registry
+// Get peak workspace usage from last FFI call
+size_t GetLastWorkspacePeak() { return g_last_workspace_peak; }
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(register_tvm_ffi_handler, JAXTVMFFIRegistry::Register);
-// get the number of handlers registered
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(registered_count, JAXTVMFFIRegistry::RegisteredCount);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_last_workspace_peak, GetLastWorkspacePeak);
 
 }  // namespace jax_tvm_ffi
