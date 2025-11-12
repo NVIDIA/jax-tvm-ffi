@@ -526,13 +526,13 @@ TVM_FFI_INLINE std::optional<tvm::ffi::Any> DecodeAttrArray(XLA_FFI_Array* array
 class JAXTVMFFIHandler : public xla::ffi::Ffi {
  public:
   JAXTVMFFIHandler(tvm::ffi::Function func, DecodeSpec decode_spec, int device_type, int traits,
-                   bool pass_owned_tensor, bool require_workspace)
+                   bool pass_owned_tensor, bool use_last_output_for_alloc_workspace)
       : func_(func),
         decode_spec_(decode_spec),
         device_type_(device_type),
         traits_(traits),
         pass_owned_tensor_(pass_owned_tensor),
-        require_workspace_(require_workspace) {}
+        use_last_output_for_alloc_workspace_(use_last_output_for_alloc_workspace) {}
 
   XLA_FFI_Error* Call(XLA_FFI_CallFrame* call_frame) const final {
     // If passed a call frame with the metadata extension, just return the
@@ -604,7 +604,7 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
     WorkspaceAllocatorContext* workspace_ctx = nullptr;
     DLPackManagedTensorAllocator prev_allocator = nullptr;
 
-    if (require_workspace_ && call_frame->rets.size > 0) {
+    if (use_last_output_for_alloc_workspace_ && call_frame->rets.size > 0) {
       // Convention: workspace is always the last return buffer
       XLA_FFI_Buffer* last_ret =
           static_cast<XLA_FFI_Buffer*>(call_frame->rets.rets[call_frame->rets.size - 1]);
@@ -634,7 +634,7 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
       int ret_code = TVMFFIEnvSetStream(call_ctx.device.device_type, call_ctx.device.device_id,
                                         call_ctx.stream, &prev_stream);
       if (XLA_FFI_PREDICT_FALSE(ret_code != 0)) {
-        if (require_workspace_) {
+        if (use_last_output_for_alloc_workspace_) {
           TVMFFIEnvSetDLPackManagedTensorAllocator(prev_allocator, 0, nullptr);
           delete workspace_ctx;
           g_workspace_ctx = nullptr;
@@ -652,7 +652,7 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
                             reinterpret_cast<TVMFFIAny*>(&result));
 
     int workspace_cleanup_failed = 0;
-    if (require_workspace_) {
+    if (use_last_output_for_alloc_workspace_) {
       int ret_code = TVMFFIEnvSetDLPackManagedTensorAllocator(prev_allocator, 0, nullptr);
       g_workspace_ctx = nullptr;
       g_last_workspace_peak = workspace_ctx->peak_used_bytes;
@@ -791,9 +791,9 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
   }
 
   XLA_FFI_Error* DecodeRets(const XLA_FFI_CallFrame* call_frame, CallContext* call_ctx) const {
-    // If require_workspace is true, skip the last buffer (which is the workspace)
+    // If use_last_output_for_alloc_workspace is true, skip the last buffer (which is the workspace)
     int64_t num_rets_to_decode = call_frame->rets.size;
-    if (require_workspace_ && num_rets_to_decode > 0) {
+    if (use_last_output_for_alloc_workspace_ && num_rets_to_decode > 0) {
       num_rets_to_decode -= 1;
     }
 
@@ -939,7 +939,7 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
   int device_type_;
   int traits_;
   bool pass_owned_tensor_;
-  bool require_workspace_;
+  bool use_last_output_for_alloc_workspace_;
 };
 
 //-------------------------------------------------------------------
@@ -948,9 +948,9 @@ class JAXTVMFFIRegistry {
  public:
   static void* Register(tvm::ffi::Function func, tvm::ffi::Array<tvm::ffi::String> arg_spec,
                         int device_type, int traits, bool pass_owned_tensor,
-                        bool require_workspace) {
+                        bool use_last_output_for_alloc_workspace) {
     return Global()->RegisterInternal(func, arg_spec, device_type, traits, pass_owned_tensor,
-                                      require_workspace);
+                                      use_last_output_for_alloc_workspace);
   }
 
   static size_t RegisteredCount() { return Global()->registered_count_; }
@@ -975,13 +975,14 @@ class JAXTVMFFIRegistry {
   // internal register function
   void* RegisterInternal(tvm::ffi::Function func, tvm::ffi::Array<tvm::ffi::String> arg_spec,
                          int device_type, int traits, bool pass_owned_tensor,
-                         bool require_workspace) {
+                         bool use_last_output_for_alloc_workspace) {
     if (registered_count_ >= kTrampolineTableSize) {
       TVM_FFI_THROW(RuntimeError) << "JAXTVMFFIRegistry: cannot register more than "
                                   << kTrampolineTableSize << " handlers";
     }
-    handler_table_[registered_count_++] = std::make_unique<JAXTVMFFIHandler>(
-        func, ParseArgSpec(arg_spec), device_type, traits, pass_owned_tensor, require_workspace);
+    handler_table_[registered_count_++] =
+        std::make_unique<JAXTVMFFIHandler>(func, ParseArgSpec(arg_spec), device_type, traits,
+                                           pass_owned_tensor, use_last_output_for_alloc_workspace);
     return reinterpret_cast<void*>(trampoline_table_[registered_count_ - 1]);
   }
 

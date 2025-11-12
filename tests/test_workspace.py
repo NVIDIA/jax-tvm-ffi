@@ -33,7 +33,7 @@ def test_workspace_cpu():
     )
 
     jax_tvm_ffi.register_ffi_target(
-        "workspace_add", mod.workspace_add, platform="cpu", require_workspace=True
+        "workspace_add", mod.workspace_add, platform="cpu", use_last_output_for_alloc_workspace=True
     )
 
     x = jnp.arange(10, device=jax.devices("cpu")[0], dtype=jnp.float32)
@@ -132,7 +132,7 @@ def test_workspace_gpu():
         mod.workspace_gpu_compute,
         platform="gpu",
         allow_cuda_graph=True,
-        require_workspace=True,
+        use_last_output_for_alloc_workspace=True,
     )
 
     x = jnp.arange(1024, device=jax.devices("gpu")[0], dtype=jnp.float32)

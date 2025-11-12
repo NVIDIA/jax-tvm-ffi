@@ -51,7 +51,7 @@ def register_ffi_target(
     *,
     allow_cuda_graph: bool = False,
     pass_owned_tensor: bool = False,
-    require_workspace: bool = False,
+    use_last_output_for_alloc_workspace: bool = False,
 ) -> Callable:
     """Function to register a ffi target for jax with tvm_ffi.Function
 
@@ -78,8 +78,8 @@ def register_ffi_target(
         in python callback when we want to further call from_dlpack on the tensor.
         However, the function should not retain the tensor after the function call.
 
-    require_workspace: bool
-        Whether the function requires workspace for temporary allocations via alloc_tensor().
+    use_last_output_for_alloc_workspace: bool
+        Whether to use the last output as allocation workspace for alloc_tensor() calls.
         If True, the user must provide workspace as the LAST element in result_shape_dtypes
         when calling the function. The workspace buffer should be jax.ShapeDtypeStruct((size,), jnp.uint8).
 
@@ -99,7 +99,7 @@ def register_ffi_target(
 
     Workspace Allocation
     --------------------
-    When require_workspace=True, the kernel can call alloc_tensor() for temporary memory.
+    When use_last_output_for_alloc_workspace=True, the kernel can call alloc_tensor() for temporary memory.
     The user must explicitly provide workspace in the output tuple at call time:
 
     Example with workspace:
@@ -107,7 +107,7 @@ def register_ffi_target(
         >>> my_kernel = register_ffi_target(
         ...     "my_kernel",
         ...     tvm_module.my_kernel,
-        ...     require_workspace=True,
+        ...     use_last_output_for_alloc_workspace=True,
         ...     platform="gpu",
         ...     allow_cuda_graph=True
         ... )
@@ -131,7 +131,12 @@ def register_ffi_target(
     traits = 1 if allow_cuda_graph else 0
     fn = jax.ffi.pycapsule(
         _LIB.register_tvm_ffi_handler(
-            function, arg_spec, dl_device_type, traits, pass_owned_tensor, require_workspace
+            function,
+            arg_spec,
+            dl_device_type,
+            traits,
+            pass_owned_tensor,
+            use_last_output_for_alloc_workspace,
         )
     )
     jax.ffi.register_ffi_target(name, fn, platform=platform)
