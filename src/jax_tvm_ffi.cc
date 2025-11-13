@@ -14,6 +14,18 @@
 #include <string>
 #include <type_traits>
 
+// Forward declarations for CUDA runtime functions
+// This allows compilation without CUDA headers, with runtime linking
+extern "C" {
+typedef void* cudaStream_t;
+typedef int cudaError_t;
+enum cudaError : int { cudaSuccess = 0 };
+
+cudaError_t cudaMallocAsync(void** ptr, size_t size, cudaStream_t stream);
+cudaError_t cudaFreeAsync(void* ptr, cudaStream_t stream);
+const char* cudaGetErrorString(cudaError_t error);
+}
+
 namespace jax_tvm_ffi {
 
 // decode action kind
@@ -69,6 +81,12 @@ static thread_local WorkspaceAllocatorContext* g_workspace_ctx = nullptr;
 /*! \brief Peak workspace usage from last call (for calibration) */
 static thread_local size_t g_last_workspace_peak = 0;
 
+/*! \brief Thread-local CUDA stream for cudaMallocAsync */
+static thread_local cudaStream_t g_cuda_stream = nullptr;
+
+/*! \brief Memory alignment for allocations (required for TMA and GPU operations) */
+constexpr size_t kTensorAllocAlignment = 128;
+
 /*!
  * \brief DLPackManagedTensorAllocator callback that carves from workspace
  * This function is called when TVM-FFI TVMFFIEnvGetDLPackManagedTensorAllocator() is used.
@@ -84,9 +102,9 @@ int WorkspaceAllocatorCallback(DLTensor* prototype, DLManagedTensorVersioned** o
 
   size_t size = WorkspaceAllocatorContext::ComputeTensorSize(prototype);
 
-  // Apply 128-byte alignment
-  constexpr size_t ALIGNMENT = 128;
-  size_t aligned_offset = (ctx->offset_bytes + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+  // Apply 128-byte alignment (required for TMA and GPU operations)
+  size_t aligned_offset =
+      (ctx->offset_bytes + kTensorAllocAlignment - 1) & ~(kTensorAllocAlignment - 1);
 
   if (aligned_offset + size > ctx->capacity_bytes) {
     char msg[256];
@@ -115,6 +133,82 @@ int WorkspaceAllocatorCallback(DLTensor* prototype, DLManagedTensorVersioned** o
   // Deleter is no-op since XLA owns the backing workspace memory
   (*out)->manager_ctx = nullptr;
   (*out)->deleter = [](DLManagedTensorVersioned* self) { delete self; };
+
+  return 0;
+}
+
+/*!
+ * \brief Deleter context for cudaMallocAsync allocations
+ */
+struct CudaMallocAsyncDeleterContext {
+  void* data;
+  cudaStream_t stream;
+};
+
+/*!
+ * \brief DLPackManagedTensorAllocator callback using cudaMallocAsync
+ * This function is called when dynamic allocation is needed (no static workspace).
+ * Uses cudaMallocAsync for stream-ordered allocation with proper 128-byte alignment.
+ * This is CUDA graph compatible and provides optimal performance.
+ *
+ * Note: Requires CUDA 11.2+
+ */
+int CudaMallocAsyncAllocatorCallback(DLTensor* prototype, DLManagedTensorVersioned** out,
+                                     void* error_ctx,
+                                     void (*SetError)(void* error_ctx, const char* kind,
+                                                      const char* message)) {
+  if (g_cuda_stream == nullptr) {
+    SetError(error_ctx, "RuntimeError", "CUDA stream not set for cudaMallocAsync");
+    return -1;
+  }
+
+  size_t size = WorkspaceAllocatorContext::ComputeTensorSize(prototype);
+
+  // Allocate using cudaMallocAsync with proper alignment
+  // cudaMallocAsync provides at least 256-byte alignment by default, which satisfies our 128-byte
+  // requirement
+  void* data = nullptr;
+  cudaError_t err = cudaMallocAsync(&data, size, g_cuda_stream);
+  if (err != cudaSuccess) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "cudaMallocAsync failed: %s", cudaGetErrorString(err));
+    SetError(error_ctx, "RuntimeError", msg);
+    return -1;
+  }
+
+  // Verify alignment (sanity check)
+  if (reinterpret_cast<uintptr_t>(data) % kTensorAllocAlignment != 0) {
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "cudaMallocAsync returned misaligned pointer: %p (required %zu-byte alignment)", data,
+             kTensorAllocAlignment);
+    cudaFreeAsync(data, g_cuda_stream);
+    SetError(error_ctx, "RuntimeError", msg);
+    return -1;
+  }
+
+  // Create DLManagedTensorVersioned wrapping the CUDA-allocated memory
+  *out = new DLManagedTensorVersioned();
+  (*out)->version.major = DLPACK_MAJOR_VERSION;
+  (*out)->version.minor = DLPACK_MINOR_VERSION;
+  (*out)->flags = 0;
+
+  (*out)->dl_tensor = *prototype;
+  (*out)->dl_tensor.data = data;
+  (*out)->dl_tensor.byte_offset = 0;
+
+  // Set up deleter to free memory with cudaFreeAsync
+  CudaMallocAsyncDeleterContext* ctx = new CudaMallocAsyncDeleterContext{data, g_cuda_stream};
+  (*out)->manager_ctx = ctx;
+  (*out)->deleter = [](DLManagedTensorVersioned* self) {
+    CudaMallocAsyncDeleterContext* ctx =
+        static_cast<CudaMallocAsyncDeleterContext*>(self->manager_ctx);
+    if (ctx != nullptr) {
+      cudaFreeAsync(ctx->data, ctx->stream);
+      delete ctx;
+    }
+    delete self;
+  };
 
   return 0;
 }
@@ -600,11 +694,11 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
     call_ctx.stack->FillStridesForTempDLTensors();
 
     // Check for workspace (flag set at registration time)
-    // Setup custom allocator to carve from XLA's pre-allocated workspace
+    // Setup custom allocator: either static workspace or cudaMallocAsync
     WorkspaceAllocatorContext* workspace_ctx = nullptr;
-    DLPackManagedTensorAllocator prev_allocator = nullptr;
 
     if (use_last_output_for_alloc_workspace_ && call_frame->rets.size > 0) {
+      // Path 1: Static workspace (CUDA graph compatible, predictable memory usage)
       // Convention: workspace is always the last return buffer
       XLA_FFI_Buffer* last_ret =
           static_cast<XLA_FFI_Buffer*>(call_frame->rets.rets[call_frame->rets.size - 1]);
@@ -613,9 +707,8 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
           new WorkspaceAllocatorContext(last_ret->data, workspace_size, call_ctx.device);
       g_workspace_ctx = workspace_ctx;
 
-      int ret_code =
-          TVMFFIEnvSetDLPackManagedTensorAllocator(WorkspaceAllocatorCallback,
-                                                   /*write_to_global=*/0, &prev_allocator);
+      int ret_code = TVMFFIEnvSetDLPackManagedTensorAllocator(WorkspaceAllocatorCallback,
+                                                              /*write_to_global=*/0, nullptr);
       if (XLA_FFI_PREDICT_FALSE(ret_code != 0)) {
         delete workspace_ctx;
         g_workspace_ctx = nullptr;
@@ -623,7 +716,19 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
                          "Failed to set workspace allocator");
       }
     } else {
-      // Reset peak for non-workspace calls to avoid stale values
+      // Path 2: cudaMallocAsync (CUDA graph compatible, dynamic allocation)
+      // Uses stream-ordered allocation with proper 128-byte alignment
+      g_cuda_stream = static_cast<cudaStream_t>(call_ctx.stream);
+
+      int ret_code = TVMFFIEnvSetDLPackManagedTensorAllocator(CudaMallocAsyncAllocatorCallback,
+                                                              /*write_to_global=*/0, nullptr);
+      if (XLA_FFI_PREDICT_FALSE(ret_code != 0)) {
+        g_cuda_stream = nullptr;
+        return MakeError(call_frame->api, XLA_FFI_Error_Code_INTERNAL,
+                         "Failed to set cudaMallocAsync allocator");
+      }
+
+      // Reset peak for cudaMallocAsync calls (no peak tracking for dynamic allocation)
       g_last_workspace_peak = 0;
     }
 
@@ -635,9 +740,10 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
                                         call_ctx.stream, &prev_stream);
       if (XLA_FFI_PREDICT_FALSE(ret_code != 0)) {
         if (use_last_output_for_alloc_workspace_) {
-          TVMFFIEnvSetDLPackManagedTensorAllocator(prev_allocator, 0, nullptr);
           delete workspace_ctx;
           g_workspace_ctx = nullptr;
+        } else {
+          g_cuda_stream = nullptr;
         }
         return MoveFromSafeCallRaisedToXLAError(call_frame, XLA_FFI_Error_Code_INTERNAL);
       }
@@ -651,9 +757,9 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
                             static_cast<int32_t>(call_ctx.stack->packed_args.size()),
                             reinterpret_cast<TVMFFIAny*>(&result));
 
-    int workspace_cleanup_failed = 0;
+    // Cleanup thread-local state
     if (use_last_output_for_alloc_workspace_) {
-      int ret_code = TVMFFIEnvSetDLPackManagedTensorAllocator(prev_allocator, 0, nullptr);
+      // Cleanup Path 1: Static workspace
       g_workspace_ctx = nullptr;
       g_last_workspace_peak = workspace_ctx->peak_used_bytes;
 
@@ -666,23 +772,19 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
       }
 
       delete workspace_ctx;
-
-      if (XLA_FFI_PREDICT_FALSE(ret_code != 0)) {
-        workspace_cleanup_failed = 1;
-      }
+    } else {
+      // Cleanup Path 2: cudaMallocAsync
+      g_cuda_stream = nullptr;
+      // Note: CUDA memory freed automatically via deleter in DLManagedTensorVersioned
     }
 
-    // Always restore stream before returning (even if workspace cleanup failed)
+    // Always restore stream before returning
     if (prev_stream != nullptr && prev_stream != call_ctx.stream) {
       int ret_code = TVMFFIEnvSetStream(call_ctx.device.device_type, call_ctx.device.device_id,
                                         prev_stream, nullptr);
       if (XLA_FFI_PREDICT_FALSE(ret_code != 0)) {
         return MoveFromSafeCallRaisedToXLAError(call_frame, XLA_FFI_Error_Code_INTERNAL);
       }
-    }
-
-    if (XLA_FFI_PREDICT_FALSE(workspace_cleanup_failed)) {
-      return MoveFromSafeCallRaisedToXLAError(call_frame, XLA_FFI_Error_Code_INTERNAL);
     }
     if (XLA_FFI_PREDICT_FALSE(call_code != 0)) {
       return MoveFromSafeCallRaisedToXLAError(call_frame, XLA_FFI_Error_Code_INTERNAL);

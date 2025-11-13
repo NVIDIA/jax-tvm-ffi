@@ -31,6 +31,16 @@ target_include_directories(jax_tvm_ffi PRIVATE ${XLA_DIR})
 target_link_libraries(jax_tvm_ffi tvm_ffi_header)
 target_link_libraries(jax_tvm_ffi tvm_ffi_shared)
 
+# Link CUDA runtime if available (for cudaMallocAsync support)
+# Uses forward declarations to compile without CUDA headers, but links at build time
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+  target_link_libraries(jax_tvm_ffi CUDA::cudart)
+  message(STATUS "CUDA Toolkit found, linking cudaMallocAsync support")
+else()
+  message(WARNING "CUDA Toolkit not found - dynamic allocation path will fail at runtime")
+endif()
+
 # show as jax_tvm_ffi.so
 set_target_properties(jax_tvm_ffi PROPERTIES PREFIX "")
 
