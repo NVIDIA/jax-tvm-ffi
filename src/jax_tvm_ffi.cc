@@ -51,16 +51,6 @@ struct WorkspaceAllocatorContext {
         offset_bytes(0),
         peak_used_bytes(0),
         device(dev) {}
-
-  /*! \brief Compute size needed for a DLTensor prototype */
-  static size_t ComputeTensorSize(const DLTensor* prototype) {
-    size_t numel = 1;
-    for (int i = 0; i < prototype->ndim; ++i) {
-      numel *= prototype->shape[i];
-    }
-    size_t bits = prototype->dtype.bits * prototype->dtype.lanes;
-    return (numel * bits + 7) / 8;  // Convert bits to bytes
-  }
 };
 
 /*! \brief Thread-local workspace context (set during handler call) */
@@ -82,7 +72,13 @@ int WorkspaceAllocatorCallback(DLTensor* prototype, DLManagedTensorVersioned** o
     return -1;
   }
 
-  size_t size = WorkspaceAllocatorContext::ComputeTensorSize(prototype);
+  // Calculate number of elements
+  size_t numel = 1;
+  for (int i = 0; i < prototype->ndim; ++i) {
+    numel *= prototype->shape[i];
+  }
+  // Use TVM-FFI's GetDataSize which handles sub-byte types correctly
+  size_t size = tvm::ffi::details::GetDataSize(numel, prototype->dtype);
 
   // Apply 128-byte alignment
   constexpr size_t ALIGNMENT = 128;
