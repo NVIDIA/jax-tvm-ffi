@@ -11,7 +11,6 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
-#include <iostream>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -44,10 +43,7 @@ class WorkspaceAllocatorContext {
   static constexpr size_t kTensorAllocAlignment = 128;
 
   WorkspaceAllocatorContext(void* base, size_t capacity, DLDevice dev)
-      : base_ptr_(base), capacity_bytes_(capacity), device_(dev) {
-    // Reserve space for leak detection tracking to avoid reallocations
-    allocated_refs_.reserve(16);
-  }
+      : base_ptr_(base), capacity_bytes_(capacity), device_(dev) {}
 
   // Prevent copying (would break leak detection)
   WorkspaceAllocatorContext(const WorkspaceAllocatorContext&) = delete;
@@ -93,10 +89,6 @@ class WorkspaceAllocatorContext {
     offset_bytes_ = aligned_offset + size;
     peak_used_bytes_ = std::max(peak_used_bytes_, offset_bytes_);
 
-    // Allocate reference counter for leak detection
-    // We use shared_ptr's built-in atomic reference counting, the int value itself doesn't matter
-    auto ref_counter = std::make_shared<int>(0);
-
     *out = new DLManagedTensorVersioned();
     (*out)->version.major = DLPACK_MAJOR_VERSION;
     (*out)->version.minor = DLPACK_MINOR_VERSION;
@@ -108,18 +100,19 @@ class WorkspaceAllocatorContext {
     // Use the device from our context (determined by XLA FFI call) rather than prototype
     (*out)->dl_tensor.device = device_;
 
-    (*out)->manager_ctx = new std::shared_ptr<int>(ref_counter);
+    // Store pointer to the thread-local counter for the deleter
+    (*out)->manager_ctx = &thread_local_alloc_counter_;
     (*out)->deleter = [](DLManagedTensorVersioned* self) {
-      // Decrement reference count via shared_ptr destruction
-      auto* ref_ptr = static_cast<std::shared_ptr<int>*>(self->manager_ctx);
-      if (ref_ptr != nullptr) {
-        delete ref_ptr;
+      // Decrement outstanding allocation counter
+      auto* counter = static_cast<std::atomic<int>*>(self->manager_ctx);
+      if (counter != nullptr) {
+        counter->fetch_sub(1, std::memory_order_relaxed);
       }
       delete self;
     };
 
-    // Track allocation for leak detection
-    allocated_refs_.push_back(ref_counter);
+    // Increment outstanding allocation counter
+    thread_local_alloc_counter_.fetch_add(1, std::memory_order_relaxed);
     return 0;
   }
 
@@ -141,16 +134,18 @@ class WorkspaceAllocatorContext {
 
   /*!
    * \brief Detect leaked allocations
-   * \return Number of leaked allocations
+   * \return Number of leaked allocations (outstanding counter value)
    */
   size_t DetectLeakedAllocations() const {
-    size_t leaked_count = 0;
-    for (const auto& ref : allocated_refs_) {
-      if (ref.use_count() > 1) {
-        leaked_count++;
-      }
-    }
-    return leaked_count;
+    return thread_local_alloc_counter_.load(std::memory_order_relaxed);
+  }
+
+  /*!
+   * \brief Reset the thread-local allocation counter
+   * Should be called when setting up a new workspace context
+   */
+  static void ResetThreadLocalAllocCounter() {
+    thread_local_alloc_counter_.store(0, std::memory_order_relaxed);
   }
 
   /*! \brief Get peak memory usage in bytes */
@@ -181,70 +176,13 @@ class WorkspaceAllocatorContext {
   size_t peak_used_bytes_ = 0;
   /*! \brief Device where the workspace resides */
   DLDevice device_ = {};
-  /*! \brief Track allocated tensors for leak detection */
-  std::vector<std::shared_ptr<int>> allocated_refs_;
 
   /*! \brief Thread-local workspace context (set during handler call) */
   static inline thread_local WorkspaceAllocatorContext* thread_local_workspace_ctx_ = nullptr;
   /*! \brief Peak workspace usage from last call (for calibration) */
   static inline thread_local size_t thread_local_workspace_peak_ = 0;
-};
-
-/*!
- * \brief RAII guard for workspace allocator context
- * Automatically sets up and tears down workspace context with leak detection
- */
-class WorkspaceGuard {
- public:
-  WorkspaceGuard(void* base, size_t capacity, DLDevice device)
-      : workspace_ctx_(base, capacity, device) {
-    WorkspaceAllocatorContext::SetThreadLocalContext(&workspace_ctx_);
-
-    int ret_code = TVMFFIEnvSetDLPackManagedTensorAllocator(
-        WorkspaceAllocatorContext::DLManagedTensorAllocFromTLS,
-        /*write_to_global=*/0, nullptr);
-
-    if (ret_code != 0) {
-      allocator_set_ = false;
-      WorkspaceAllocatorContext::SetThreadLocalContext(nullptr);
-    } else {
-      allocator_set_ = true;
-    }
-  }
-
-  ~WorkspaceGuard() {
-    if (!allocator_set_) return;
-
-    // Run leak detection
-    size_t leaked = workspace_ctx_.DetectLeakedAllocations();
-    if (leaked > 0) {
-      std::cerr << "[JAX-TVM-FFI] WARNING: Detected " << leaked << " leaked workspace allocations"
-                << std::endl;
-    }
-
-    // Save peak usage
-    WorkspaceAllocatorContext::SetThreadLocalPeak(workspace_ctx_.peak_used_bytes());
-
-    // Debug output
-    if (const char* debug = std::getenv("JAX_TVM_FFI_DEBUG_WORKSPACE")) {
-      if (debug[0] == '1') {
-        std::cerr << "[JAX-TVM-FFI] Workspace: " << workspace_ctx_.peak_used_bytes() << " / "
-                  << workspace_ctx_.capacity_bytes() << " bytes ("
-                  << (100.0 * workspace_ctx_.peak_used_bytes() / workspace_ctx_.capacity_bytes())
-                  << "%)" << std::endl;
-      }
-    }
-
-    // Clear allocator and context
-    TVMFFIEnvSetDLPackManagedTensorAllocator(nullptr, 0, nullptr);
-    WorkspaceAllocatorContext::SetThreadLocalContext(nullptr);
-  }
-
-  bool is_valid() const { return allocator_set_; }
-
- private:
-  WorkspaceAllocatorContext workspace_ctx_;
-  bool allocator_set_ = false;
+  /*! \brief Thread-local outstanding allocation counter for leak detection */
+  static inline thread_local std::atomic<int> thread_local_alloc_counter_{0};
 };
 
 // Decode Item used to decode a call frame into the call stack
@@ -455,6 +393,8 @@ class CallContext {
   DLDevice device;
   /*! \brief Detected stream, if any */
   void* stream = nullptr;
+  /*! \brief workspace allocator context (if workspace is used) */
+  std::unique_ptr<WorkspaceAllocatorContext> workspace_ctx_;
 
   CallContext() {
     stack = ThreadLocalStack();
@@ -466,6 +406,17 @@ class CallContext {
 
   // RAII exit, clear the stack
   ~CallContext() {
+    // Cleanup workspace allocator if it was set up
+    if (workspace_ctx_) {
+      // Clear allocator and TLS context
+      TVMFFIEnvSetDLPackManagedTensorAllocator(nullptr, 0, nullptr);
+      WorkspaceAllocatorContext::SetThreadLocalContext(nullptr);
+
+      // Save peak usage for calibration
+      WorkspaceAllocatorContext::SetThreadLocalPeak(workspace_ctx_->peak_used_bytes());
+    }
+
+    // Clear stack
     stack->packed_args.clear();
     stack->temp_owned_tensors_.clear();
     stack->temp_dltensors_.clear();
@@ -473,10 +424,38 @@ class CallContext {
     stack->temp_shapes_.clear();
   }
 
+  /*!
+   * \brief Setup workspace allocator from XLA-provided buffer
+   * \param base Base pointer of workspace buffer
+   * \param capacity Size of workspace in bytes
+   * \param dev Device where workspace resides
+   * \return true on success, false on failure
+   */
+  bool SetupWorkspace(void* base, size_t capacity, DLDevice dev) {
+    // Reset allocation counter for this call
+    WorkspaceAllocatorContext::ResetThreadLocalAllocCounter();
+
+    workspace_ctx_ = std::make_unique<WorkspaceAllocatorContext>(base, capacity, dev);
+    WorkspaceAllocatorContext::SetThreadLocalContext(workspace_ctx_.get());
+
+    int ret_code = TVMFFIEnvSetDLPackManagedTensorAllocator(
+        WorkspaceAllocatorContext::DLManagedTensorAllocFromTLS,
+        /*write_to_global=*/0, nullptr);
+
+    if (ret_code != 0) {
+      WorkspaceAllocatorContext::SetThreadLocalContext(nullptr);
+      workspace_ctx_.reset();
+      return false;
+    }
+
+    return true;
+  }
+
  private:
   // temporary stack for the call context
   // only when thread local stack is already in use
   std::unique_ptr<Stack> temp_stack_;
+
   // by default we use thread local stack
   // to avoid repeated allocation/deallocation of stack
   Stack* ThreadLocalStack() {
@@ -727,18 +706,15 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
     // fill in strides for the temp DLTensors
     call_ctx.stack->FillStridesForTempDLTensors();
 
-    // Setup workspace allocator using RAII guard (if requested)
-    std::unique_ptr<WorkspaceGuard> workspace_guard;
+    // Setup workspace allocator in CallContext (if requested)
     if (use_last_output_for_alloc_workspace_ && call_frame->rets.size > 0) {
       // Convention: workspace is always the last return buffer
       XLA_FFI_Buffer* last_ret =
           static_cast<XLA_FFI_Buffer*>(call_frame->rets.rets[call_frame->rets.size - 1]);
       size_t workspace_size = last_ret->dims[0];
 
-      workspace_guard =
-          std::make_unique<WorkspaceGuard>(last_ret->data, workspace_size, call_ctx.device);
-
-      if (XLA_FFI_PREDICT_FALSE(!workspace_guard->is_valid())) {
+      if (XLA_FFI_PREDICT_FALSE(
+              !call_ctx.SetupWorkspace(last_ret->data, workspace_size, call_ctx.device))) {
         return MakeError(call_frame->api, XLA_FFI_Error_Code_INTERNAL,
                          "Failed to set workspace allocator");
       }
@@ -784,6 +760,15 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
         XLA_FFI_PREDICT_FALSE(call_ctx.stack->DetectedLeakedTempTensors() != 0)) {
       return MakeError(call_frame->api, XLA_FFI_Error_Code_INTERNAL,
                        "Leaked temp owned tensors, cannot retain ffi::Tensor in the function");
+    }
+    // Check for workspace leaks if workspace was used
+    if (use_last_output_for_alloc_workspace_ && call_ctx.workspace_ctx_) {
+      size_t leaked = call_ctx.workspace_ctx_->DetectLeakedAllocations();
+      if (XLA_FFI_PREDICT_FALSE(leaked > 0)) {
+        return MakeError(
+            call_frame->api, XLA_FFI_Error_Code_INTERNAL,
+            "Leaked workspace allocations, cannot retain workspace tensors beyond FFI call");
+      }
     }
     return Success();
   }
