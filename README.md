@@ -114,3 +114,13 @@ jax_tvm_ffi.register_ffi_target(
     pass_owned_tensor=True
 )
 ```
+
+## CuTeDSL Integration
+
+For an example of integrating high-performance [CuTeDSL](https://github.com/NVIDIA/cutlass) kernels
+with JAX (including JIT, autodiff, and multi-GPU support), see [examples/cutedsl/](examples/cutedsl/).
+
+```bash
+pip install jax-tvm-ffi[cutedsl]
+python -m examples.cutedsl.jax_softmax
+```
