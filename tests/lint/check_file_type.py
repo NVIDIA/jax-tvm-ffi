@@ -168,7 +168,7 @@ def check_spdx_header(fname: str) -> tuple[bool, str]:
         "CONTRIBUTING.md",
     }
     if (
-        fname.endswith((".png", ".whl"))
+        fname.endswith((".png", ".whl", ".txt"))
         or not Path(fname).is_file()
         or Path(fname).name in skip_files
     ):

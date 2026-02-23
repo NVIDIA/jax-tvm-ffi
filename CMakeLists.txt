@@ -28,8 +28,8 @@ message(STATUS "XLA include directory: ${XLA_DIR}")
 # use the projects as usual
 add_library(jax_tvm_ffi SHARED src/jax_tvm_ffi.cc)
 target_include_directories(jax_tvm_ffi PRIVATE ${XLA_DIR})
-target_link_libraries(jax_tvm_ffi tvm_ffi_header)
-target_link_libraries(jax_tvm_ffi tvm_ffi_shared)
+target_link_libraries(jax_tvm_ffi tvm_ffi::header)
+target_link_libraries(jax_tvm_ffi tvm_ffi::shared)
 
 # show as jax_tvm_ffi.so
 set_target_properties(jax_tvm_ffi PROPERTIES PREFIX "")
