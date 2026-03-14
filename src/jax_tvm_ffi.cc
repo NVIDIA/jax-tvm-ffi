@@ -500,6 +500,9 @@ TVM_FFI_INLINE std::optional<DLDataType> DecodeDataType(XLA_FFI_DataType dtype) 
     case XLA_FFI_DataType_F32: {
       return DLDataType{kDLFloat, 32, 1};
     }
+    case XLA_FFI_DataType_F64: {
+      return DLDataType{kDLFloat, 64, 1};
+    }
     case XLA_FFI_DataType_BF16: {
       return DLDataType{kDLBfloat, 16, 1};
     }
