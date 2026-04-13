@@ -1,1 +1,1 @@
-apache-tvm-ffi==0.1.8.post2
+apache-tvm-ffi==0.1.10
