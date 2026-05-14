@@ -103,6 +103,10 @@ unfixable = []
   "E741", # pycodestyle: ambiguous-variable-name
   "ANN",  # flake8-annotations: no type hints required in tests
 ]
+"examples/flashinfer/*.py" = [
+    "ANN",     # Tutorial/example code does not need full type annotations.
+    "PLR0913", # FFI callback signatures intentionally mirror kernel ABI signatures.
+]
 
 [tool.ruff.lint.pylint]
 max-args = 10

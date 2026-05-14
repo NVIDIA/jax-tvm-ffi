@@ -50,6 +50,8 @@ ALLOW_EXTENSION = {
     "md",
     "rst",
     "css",
+    # Jupyter notebooks
+    "ipynb",
     # sgx
     "edl",
     "lds",
@@ -168,7 +170,7 @@ def check_spdx_header(fname: str) -> tuple[bool, str]:
         "CONTRIBUTING.md",
     }
     if (
-        fname.endswith((".png", ".whl", ".txt"))
+        fname.endswith((".png", ".whl", ".txt", ".ipynb"))
         or not Path(fname).is_file()
         or Path(fname).name in skip_files
     ):
