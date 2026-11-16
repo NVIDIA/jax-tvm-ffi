@@ -121,15 +121,14 @@ ordering. Complete `jax.distributed.initialize()` and other backend
 configuration before constructing these calls.
 
 CUTLASS DSL users can obtain CUDA object bytes, an exported name, and a SHA-256
-digest with `jax_tvm_ffi.cutlass.compile_to_object`. The helper uses the
-legacy TVM-FFI compilation path, then asks the returned compiled handle for its
+digest with `jax_tvm_ffi.cutlass.compile_to_object`. The helper uses
+`cute.compile[EnableTVMFFI]`, then asks the returned compiled handle for its
 object bytes. CuTe DSL 4.9.0.dev1 includes object dumping and exports
 `__tvm_ffi_module_init` while retaining the kernel's lazy CUDA initialization.
-The helper selects `DisableCuteExtCompile` because the default extension
-compiler does not support object dumping. It loads the CuTe runtime libraries
-with process-global symbol visibility and retains them for module teardown. A
-process that consumes an already-serialized executable without recompiling
-must call `jax_tvm_ffi.cutlass.load_runtime()` first.
+The helper loads the CuTe runtime libraries with process-global symbol
+visibility and retains them for module teardown. A process that consumes an
+already-serialized executable without recompiling must call
+`jax_tvm_ffi.cutlass.load_runtime()` first.
 
 ```python
 from jax_tvm_ffi.cutlass import compile_to_object

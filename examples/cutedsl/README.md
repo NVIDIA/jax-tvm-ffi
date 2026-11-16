@@ -37,22 +37,20 @@ python -m examples.cutedsl.jax_softmax_serialized
 ```
 
 CuTe DSL 4.9.0.dev1 and ORCJIT 0.1.1 are published on PyPI. The CuTe release lets
-a legacy CUDA TVM-FFI compiled handle dump itself to object bytes. The object
+a CUDA TVM-FFI compiled handle dump itself to object bytes. The object
 preserves the kernel's lazy CUDA initialization and exports
 `__tvm_ffi_module_init` for explicit initialization. ORCJIT 0.1.2 and later use
 a different native loader API and are not supported by this prototype.
 
-The serialized example selects
-`cute.compile[EnableTVMFFI, cute.DisableCuteExtCompile]` because the default
-extension compiler does not support object dumping. It serializes the compiled
-handle into a `SerializedFunction` containing the
-TVM FFI object bytes, exported function name, and SHA-256 digest. It embeds the
-bytes and name in the HLO without writing an object file. The installed ORCJIT
+The serialized example uses `cute.compile[EnableTVMFFI]` and serializes the
+compiled handle into a `SerializedFunction` containing the TVM FFI object bytes,
+exported function name, and SHA-256 digest. It embeds the bytes and name in the
+HLO without writing an object file. The installed ORCJIT
 extension loads object bytes through its existing execution-session API. JAX
 TVM FFI caches the loaded module weakly by object SHA-256 and resolves each
 requested function from it. Live JAX executables own the shared module. The
 reusable entry point is `jax_tvm_ffi.cutlass.compile_to_object`. Pass additional
-legacy compiler flags in the `compile_options` string; they are appended after
+compiler flags in the `compile_options` string; they are appended after
 the helper's defaults and can override them. The helper always adds
 `--enable-tvm-ffi`. It also loads the installed CuTe runtime libraries with
 process-global visibility so ORCJIT can resolve the object's runtime symbols;

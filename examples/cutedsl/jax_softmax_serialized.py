@@ -3,7 +3,7 @@
 """JAX integration for serialized CuTe DSL softmax kernels.
 
 Unlike ``jax_softmax``, this example does not keep a process-global TVM FFI
-function registration. It dumps each legacy compiled handle to in-memory
+function registration. It dumps each TVM FFI compiled handle to in-memory
 object bytes and embeds them in the StableHLO custom call. JAX TVM FFI weakly
 interns each ORCJIT module by object SHA-256; live executables own the shared
 module and resolve its TVM FFI exports.

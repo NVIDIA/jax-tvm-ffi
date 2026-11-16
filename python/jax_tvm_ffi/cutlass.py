@@ -59,7 +59,7 @@ def compile_to_object(
         *compile_args: Representative arguments describing its runtime signature.
         gpu_arch: Optional CuTe target such as ``sm_90a``. When omitted, CuTe
             uses its normal target selection.
-        compile_options: Additional legacy ``cute.compile`` options. They are
+        compile_options: Additional ``cute.compile`` options. They are
             appended after the helper's defaults so they can override them.
             TVM FFI remains enabled.
 
@@ -67,9 +67,8 @@ def compile_to_object(
         The object bytes, exported TVM FFI function name, and SHA-256 digest.
 
     Notes:
-        This helper selects the legacy TVM FFI compiler because the default
-        extension compiler in CuTe DSL 4.9 does not support object dumping.
-        It serializes the compiled handle with its module initializer.
+        This helper enables TVM FFI and serializes the compiled handle with
+        its module initializer.
         Runtime libraries are loaded globally so ORCJIT can resolve the
         object's host-runtime symbols.
     """
@@ -89,7 +88,7 @@ def compile_to_object(
 
     with _COMPILE_LOCK:
         load_runtime()
-        compiled = cute.compile[cutlass_dsl.EnableTVMFFI, cute.DisableCuteExtCompile](
+        compiled = cute.compile[cutlass_dsl.EnableTVMFFI](
             function,
             *compile_args,
             options=" ".join(options),

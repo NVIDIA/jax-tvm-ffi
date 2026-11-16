@@ -46,7 +46,6 @@ def fake_cutlass(monkeypatch):
 
     cute_module = types.ModuleType("cutlass.cute")
     cute_module.compile = CompileCallable()
-    cute_module.DisableCuteExtCompile = object()
 
     runtime_module = types.ModuleType("cutlass.runtime")
 
@@ -71,11 +70,10 @@ def fake_cutlass(monkeypatch):
         lambda path, *, mode: state.calls.append(("load_runtime", path, mode)) or object(),
     )
     state.enable_tvm_ffi = enable_tvm_ffi
-    state.disable_cute_ext_compile = cute_module.DisableCuteExtCompile
     return state
 
 
-def test_compile_to_object_dumps_legacy_compiled_handle(fake_cutlass):
+def test_compile_to_object_dumps_tvm_ffi_compiled_handle(fake_cutlass):
     function = lambda: None
 
     result = cutlass.compile_to_object(
@@ -97,10 +95,7 @@ def test_compile_to_object_dumps_legacy_compiled_handle(fake_cutlass):
             "/fake/libcute_dsl_runtime.so",
             getattr(cutlass.os, "RTLD_NOW", 0) | getattr(cutlass.os, "RTLD_GLOBAL", 0),
         ),
-        (
-            "compile_option",
-            (fake_cutlass.enable_tvm_ffi, fake_cutlass.disable_cute_ext_compile),
-        ),
+        ("compile_option", fake_cutlass.enable_tvm_ffi),
         (
             "compile",
             function,
