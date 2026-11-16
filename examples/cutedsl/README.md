@@ -11,13 +11,15 @@ High-performance softmax kernel written in [CuTeDSL](https://github.com/NVIDIA/c
 
 ## Installation
 
+From the repository root:
+
 ```bash
-pip install jax-tvm-ffi[cutedsl]
+pip install -e ".[cutedsl]"
 ```
 
 Or install dependencies separately:
 ```bash
-pip install jax-tvm-ffi nvidia-cutlass-dsl
+pip install -e . "nvidia-cutlass-dsl==4.9.0.dev1"
 ```
 
 ## Quick Start
@@ -27,21 +29,23 @@ python -m examples.cutedsl.jax_softmax
 ```
 
 To embed the compiled native objects in StableHLO instead of registering live
-TVM FFI function handles, install the ORCJIT 0.1.1+ extra and run the serialized version:
+TVM FFI function handles, install the pinned ORCJIT 0.1.1 extra and run the serialized version:
 
 ```bash
-pip install "jax-tvm-ffi[cutedsl,orcjit]"
+pip install -e ".[cutedsl,orcjit]"
 python -m examples.cutedsl.jax_softmax_serialized
 ```
 
-The serialized path requires the coordinated CuTe DSL change that lets a legacy
-CUDA TVM-FFI compiled handle dump itself to object bytes. The object preserves the
-kernel's lazy CUDA initialization and exports `__tvm_ffi_module_init` for
-explicit initialization. Use a DKG source build until that change and ORCJIT
-0.1.1 are published.
+CuTe DSL 4.9.0.dev1 and ORCJIT 0.1.1 are published on PyPI. The CuTe release lets
+a legacy CUDA TVM-FFI compiled handle dump itself to object bytes. The object
+preserves the kernel's lazy CUDA initialization and exports
+`__tvm_ffi_module_init` for explicit initialization. ORCJIT 0.1.2 and later use
+a different native loader API and are not supported by this prototype.
 
-The serialized example uses the established `cute.compile[EnableTVMFFI]` path
-and serializes its compiled handle into a `SerializedFunction` containing the
+The serialized example selects
+`cute.compile[EnableTVMFFI, cute.DisableCuteExtCompile]` because the default
+extension compiler does not support object dumping. It serializes the compiled
+handle into a `SerializedFunction` containing the
 TVM FFI object bytes, exported function name, and SHA-256 digest. It embeds the
 bytes and name in the HLO without writing an object file. The installed ORCJIT
 extension loads object bytes through its existing execution-session API. JAX

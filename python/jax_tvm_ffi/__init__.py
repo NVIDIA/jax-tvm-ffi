@@ -120,7 +120,23 @@ def _get_dl_device_type(platform: str) -> int:
         raise ValueError(f"Unsupported platform: {platform}")
 
 
-def _register_payload_target(platform: str) -> str:
+def register_payload_target(platform: str = "gpu") -> str:
+    """Register the predefined target for loading payload-backed executables.
+
+    Call this in a fresh process before deserializing a compiled executable or
+    calling a deserialized JAX export. It registers the bridge and its state
+    type without requiring the original object bytes or Python callable.
+    Repeated registration for the same platform is safe. Returns the target
+    name, which can also be used with ``jax.export.DisabledSafetyCheck.custom_call``.
+
+    Import ``tvm_ffi_orcjit`` before loading object-backed executables. For a
+    custom payload format, register its TVM global loader instead. Load any
+    libraries required by the objects, such as the CuTe DSL runtime, as well.
+
+    This initializes the selected JAX backend. Complete distributed
+    initialization and backend configuration before calling this function.
+    """
+    device_type = int(_get_dl_device_type(platform))
     target = _PAYLOAD_TARGET
     with _payload_registration_lock:
         if platform in _registered_payload_targets:
@@ -135,7 +151,6 @@ def _register_payload_target(platform: str) -> str:
         if platform in _registered_payload_targets:
             return target
 
-        device_type = int(_get_dl_device_type(platform))
         jax.ffi.register_ffi_type(
             f"jax_tvm_ffi.payload_call_state.{platform}",
             {
@@ -207,7 +222,7 @@ def _ffi_call_from_payload(  # noqa: PLR0913
         raise ValueError("output_layouts must describe only the visible results")
     encoded_arg_spec, expected_attr_names = _encode_arg_spec(arg_spec)
 
-    target = _register_payload_target(platform)
+    target = register_payload_target(platform)
     result_leaves, result_tree = jax.tree.flatten(result_shape_dtypes)
     workspace_results = tuple(
         jax.ShapeDtypeStruct((workspace.size_in_bytes,), jnp.uint8) for workspace in workspaces

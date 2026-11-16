@@ -67,9 +67,9 @@ def compile_to_object(
         The object bytes, exported TVM FFI function name, and SHA-256 digest.
 
     Notes:
-        This helper uses the established ``cute.compile`` path and serializes
-        its compiled handle directly. It requires CuTe DSL support for dumping
-        TVM FFI compiled handles to object bytes with a module initializer.
+        This helper selects the legacy TVM FFI compiler because the default
+        extension compiler in CuTe DSL 4.9 does not support object dumping.
+        It serializes the compiled handle with its module initializer.
         Runtime libraries are loaded globally so ORCJIT can resolve the
         object's host-runtime symbols.
     """
@@ -89,7 +89,7 @@ def compile_to_object(
 
     with _COMPILE_LOCK:
         load_runtime()
-        compiled = cute.compile[cutlass_dsl.EnableTVMFFI](
+        compiled = cute.compile[cutlass_dsl.EnableTVMFFI, cute.DisableCuteExtCompile](
             function,
             *compile_args,
             options=" ".join(options),
@@ -101,7 +101,7 @@ def compile_to_object(
         if b"__tvm_ffi_module_init" not in object_bytes:
             raise RuntimeError(
                 "CuTe DSL emitted an object without __tvm_ffi_module_init; "
-                "use a source build with legacy TVM FFI object serialization support"
+                "install nvidia-cutlass-dsl==4.9.0.dev1 with TVM FFI object serialization support"
             )
         return SerializedFunction(
             object_bytes=object_bytes,

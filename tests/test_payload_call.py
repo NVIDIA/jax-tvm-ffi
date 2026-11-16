@@ -3,6 +3,7 @@
 
 import gc
 import os
+import pickle
 import subprocess
 import sys
 import threading
@@ -17,6 +18,7 @@ import pytest
 import tvm_ffi
 import tvm_ffi.cpp
 from jax import numpy as jnp
+from jax.experimental import serialize_executable
 
 _PAYLOAD_CPP_SOURCE = r"""
     void add(tvm::ffi::Any increment, tvm::ffi::TensorView y,
@@ -249,6 +251,49 @@ def test_object_call_loads_orcjit_object(object_bytes, request):
 
     add_two = jax.jit(lambda value: call(value, increment=2))
     numpy.testing.assert_equal(numpy.asarray(add_two(x)), numpy.asarray(x + 2))
+
+
+def test_object_executable_round_trip_in_fresh_process(object_bytes, tmp_path):
+    call = jax_tvm_ffi.ffi_call_from_object(
+        object_bytes,
+        "add",
+        jax.ShapeDtypeStruct((8,), jnp.float32),
+        platform="cpu",
+        arg_spec=("attrs.increment", "rets", "args"),
+        workspaces=(jax_tvm_ffi.Workspace(64),),
+    )
+    x = jnp.arange(8, dtype=jnp.float32)
+    compiled = jax.jit(lambda value: call(value, increment=2)).lower(x).compile()
+    executable_path = tmp_path / "executable.pkl"
+    executable_path.write_bytes(pickle.dumps(serialize_executable.serialize(compiled)))
+
+    script = """
+import pickle
+import sys
+from pathlib import Path
+
+import jax.numpy as jnp
+import jax_tvm_ffi
+import numpy
+import tvm_ffi_orcjit
+from jax.experimental import serialize_executable
+
+jax_tvm_ffi.register_payload_target(platform="cpu")
+jax_tvm_ffi.register_payload_target(platform="cpu")
+compiled = serialize_executable.deserialize_and_load(
+    *pickle.loads(Path(sys.argv[1]).read_bytes()), backend="cpu"
+)
+x = jnp.arange(8, dtype=jnp.float32)
+numpy.testing.assert_equal(numpy.asarray(compiled(x)), numpy.asarray(x + 2))
+"""
+    environment = os.environ.copy()
+    environment["JAX_PLATFORMS"] = "cpu"
+    subprocess.run(
+        [sys.executable, "-c", script, str(executable_path)],
+        check=True,
+        env=environment,
+        timeout=60,
+    )
 
 
 def test_object_entry_points_share_module_cache(object_bytes, request):

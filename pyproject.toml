@@ -18,11 +18,8 @@ requires-python = ">=3.11"
 dependencies = ["jax>=0.8.1", "apache-tvm-ffi>=0.1.8.post2"]
 
 [project.optional-dependencies]
-cutedsl = ["nvidia-cutlass-dsl>=4.6"]
-orcjit = ["apache-tvm-ffi-orcjit>=0.1.1"]
-
-[tool.uv.sources]
-apache-tvm-ffi-orcjit = { git = "https://github.com/apache/tvm-ffi.git", rev = "c4a89570a9b361301eded1aff7933f5a7ff2f9f3", subdirectory = "addons/tvm_ffi_orcjit" }
+cutedsl = ["nvidia-cutlass-dsl==4.9.0.dev1"]
+orcjit = ["apache-tvm-ffi-orcjit==0.1.1"]
 
 [build-system]
 requires = ["scikit-build-core>=0.10.0", "apache-tvm-ffi>=0.1.8.post2", "jax>=0.8.1"]
