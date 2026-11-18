@@ -29,18 +29,17 @@ python -m examples.cutedsl.jax_softmax
 ```
 
 To embed the compiled native objects in StableHLO instead of registering live
-TVM FFI function handles, install the pinned ORCJIT 0.1.1 extra and run the serialized version:
+TVM FFI function handles, install the pinned ORCJIT 0.1.3 extra and run the serialized version:
 
 ```bash
 pip install -e ".[cutedsl,orcjit]"
 python -m examples.cutedsl.jax_softmax_serialized
 ```
 
-CuTe DSL 4.9.0.dev1 and ORCJIT 0.1.1 are published on PyPI. The CuTe release lets
+CuTe DSL 4.9.0.dev1 and ORCJIT 0.1.3 are published on PyPI. The CuTe release lets
 a CUDA TVM-FFI compiled handle dump itself to object bytes. The object
 preserves the kernel's lazy CUDA initialization and exports
-`__tvm_ffi_module_init` for explicit initialization. ORCJIT 0.1.2 and later use
-a different native loader API and are not supported by this prototype.
+`__tvm_ffi_module_init` for explicit initialization.
 
 The serialized example uses `cute.compile[EnableTVMFFI]` and serializes the
 compiled handle into a `SerializedFunction` containing the TVM FFI object bytes,

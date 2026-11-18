@@ -1107,7 +1107,9 @@ tvm::ffi::Module LoadOrcjitObjectModule(const tvm::ffi::Bytes& object_bytes) {
 
   tvm::ffi::ObjectRef session = (*default_session)().cast<tvm::ffi::ObjectRef>();
   tvm::ffi::Array<tvm::ffi::Variant<tvm::ffi::String, tvm::ffi::Bytes>> objects{object_bytes};
-  return (*load_module)(session, objects, tvm::ffi::String()).cast<tvm::ffi::Module>();
+  // Resolve C++ runtime symbols from the process without selecting a host compiler.
+  return (*load_module)(session, objects, tvm::ffi::String(), nullptr, nullptr)
+      .cast<tvm::ffi::Module>();
 }
 
 constexpr std::array<int8_t, 256> MakeBase64DecodeTable() {

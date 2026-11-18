@@ -93,14 +93,13 @@ result = jax.ffi.ffi_call("my.function", output_shape)(x, y, eps=1e-5)
 
 ### Object-backed calls
 
-Install this branch with CuTe DSL 4.9.0.dev1 and the ORCJIT 0.1.1 loader:
+Install this branch with CuTe DSL 4.9.0.dev1 and the ORCJIT 0.1.3 loader:
 
 ```bash
 pip install -e ".[cutedsl,orcjit]"
 ```
 
-Both versions are published on PyPI and pinned by the extras. ORCJIT 0.1.2 and
-later changed the native loader API and are not supported by this prototype.
+Both versions are published on PyPI and pinned by the extras.
 With uv, use `uv sync --extra cutedsl --extra orcjit --prerelease allow` to
 enable CuTe DSL's transitive development dependencies.
 
@@ -114,6 +113,10 @@ the exported host launcher from that module. Each executable strongly owns the
 shared module, resolved function, and decoded argument mapping for every launch.
 The cache does not extend module lifetime, so a module can unload after its last
 executable and in-flight instantiation owner is destroyed.
+
+The native loader resolves C++ runtime symbols from the consuming process. It
+leaves ORCJIT's optional C++ runtime-library paths unset and does not perform
+the Python wrapper's compiler-specific runtime discovery.
 
 Creating the first payload-, object-, or serialized-function call for a
 platform initializes that JAX backend to satisfy state-type registration
