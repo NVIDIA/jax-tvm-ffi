@@ -57,6 +57,48 @@ call
 `jax_tvm_ffi.cutlass.load_runtime()` when loading a previously serialized JAX
 executable in a fresh process without recompiling the kernel first.
 
+## Export and AOT deployment
+
+The producer compiles a `(32, 1024)` float32 softmax and writes two artifacts.
+Both contain the compiled TVM-FFI object bytes and exported function name:
+
+```bash
+pip install -e ".[cutedsl,orcjit]" flatbuffers
+python -m examples.cutedsl.export_softmax /tmp/softmax-artifacts
+```
+
+Run each consumer command in a new process:
+
+```bash
+# Load the exported JAX program, compile it with XLA, then execute.
+python -m examples.cutedsl.run_exported_softmax /tmp/softmax-artifacts/softmax.jax
+
+# Load the AOT executable and execute without recompiling the JAX computation.
+python -m examples.cutedsl.run_exported_softmax /tmp/softmax-artifacts/softmax.pkl --format executable
+```
+
+The [producer](export_softmax.py) uses `jax.export.export(...).serialize()` for
+`softmax.jax` and `jax.jit(...).lower(...).compile()` followed by
+`serialize_executable.serialize(...)` for `softmax.pkl`. Export explicitly
+allows the predefined `jax_tvm_ffi.payload_call` custom call via
+`DisabledSafetyCheck.custom_call`; the bridge and embedded object's compatibility
+are the application's responsibility.
+
+The [consumer](run_exported_softmax.py) imports ORCJIT, loads the CuTe runtime,
+and registers the predefined payload target. It never imports `softmax.py` or
+the producer's kernel-registration code. ORCJIT restores the function from the
+embedded object, and the consumer checks its result against NumPy. Neither
+consumer path recompiles the CuTe kernel. The `jax.export` path still compiles
+the surrounding JAX computation with XLA before execution.
+
+Both processes require a CUDA-enabled JAX installation, this branch of
+`jax-tvm-ffi`, ORCJIT, and the CuTe runtime libraries supplied by the pinned CuTe
+package. The producer also needs the kernel source and CuTe compiler. Use
+compatible host and GPU architectures and runtime libraries: embedding native
+object bytes restricts the export's portability. For the experimental AOT
+executable format, use matching JAX/jaxlib versions and a compatible device
+configuration in the producer and consumer.
+
 ## Usage
 
 ```python
@@ -100,3 +142,5 @@ if len(devices) >= 2:
 | `softmax.py` | CuTeDSL kernel implementations (forward + backward) |
 | `jax_softmax.py` | JAX integration of the softmax kernel |
 | `jax_softmax_serialized.py` | JAX integration with object bytes embedded in StableHLO |
+| `export_softmax.py` | Producer: write a JAX export and an AOT executable containing CuTe object bytes |
+| `run_exported_softmax.py` | Consumer: restore either artifact without importing the kernel source |

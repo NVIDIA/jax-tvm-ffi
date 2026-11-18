@@ -17,6 +17,7 @@ import numpy
 import pytest
 import tvm_ffi
 import tvm_ffi.cpp
+from jax import export
 from jax import numpy as jnp
 from jax.experimental import serialize_executable
 
@@ -253,7 +254,8 @@ def test_object_call_loads_orcjit_object(object_bytes, request):
     numpy.testing.assert_equal(numpy.asarray(add_two(x)), numpy.asarray(x + 2))
 
 
-def test_object_executable_round_trip_in_fresh_process(object_bytes, tmp_path):
+@pytest.mark.parametrize("artifact_format", ["export", "executable"])
+def test_object_round_trip_in_fresh_process(object_bytes, tmp_path, artifact_format):
     call = jax_tvm_ffi.ffi_call_from_object(
         object_bytes,
         "add",
@@ -262,34 +264,53 @@ def test_object_executable_round_trip_in_fresh_process(object_bytes, tmp_path):
         arg_spec=("attrs.increment", "rets", "args"),
         workspaces=(jax_tvm_ffi.Workspace(64),),
     )
-    x = jnp.arange(8, dtype=jnp.float32)
-    compiled = jax.jit(lambda value: call(value, increment=2)).lower(x).compile()
-    executable_path = tmp_path / "executable.pkl"
-    executable_path.write_bytes(pickle.dumps(serialize_executable.serialize(compiled)))
+    input_spec = jax.ShapeDtypeStruct((8,), jnp.float32)
+    add_two = jax.jit(lambda value: call(value, increment=2))
+    artifact_path = tmp_path / "artifact"
+    if artifact_format == "export":
+        pytest.importorskip("flatbuffers")
+        target = jax_tvm_ffi.register_payload_target(platform="cpu")
+        exported = export.export(
+            add_two,
+            platforms=("cpu",),
+            disabled_checks=(export.DisabledSafetyCheck.custom_call(target),),
+        )(input_spec)
+        artifact_path.write_bytes(exported.serialize())
+    else:
+        compiled = add_two.lower(input_spec).compile()
+        artifact_path.write_bytes(pickle.dumps(serialize_executable.serialize(compiled)))
 
     script = """
 import pickle
 import sys
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import jax_tvm_ffi
 import numpy
 import tvm_ffi_orcjit
+from jax import export
 from jax.experimental import serialize_executable
 
 jax_tvm_ffi.register_payload_target(platform="cpu")
 jax_tvm_ffi.register_payload_target(platform="cpu")
-compiled = serialize_executable.deserialize_and_load(
-    *pickle.loads(Path(sys.argv[1]).read_bytes()), backend="cpu"
-)
+artifact = Path(sys.argv[1]).read_bytes()
+if sys.argv[2] == "export":
+    exported = export.deserialize(bytearray(artifact))
+    input_spec = jax.ShapeDtypeStruct((8,), jnp.float32)
+    compiled = jax.jit(exported.call).lower(input_spec).compile()
+else:
+    compiled = serialize_executable.deserialize_and_load(
+        *pickle.loads(artifact), backend="cpu"
+    )
 x = jnp.arange(8, dtype=jnp.float32)
 numpy.testing.assert_equal(numpy.asarray(compiled(x)), numpy.asarray(x + 2))
 """
     environment = os.environ.copy()
     environment["JAX_PLATFORMS"] = "cpu"
     subprocess.run(
-        [sys.executable, "-c", script, str(executable_path)],
+        [sys.executable, "-c", script, str(artifact_path), artifact_format],
         check=True,
         env=environment,
         timeout=60,

@@ -93,6 +93,17 @@ result = jax.ffi.ffi_call("my.function", output_shape)(x, y, eps=1e-5)
 
 ### Object-backed calls
 
+Export and ahead-of-time deployment are the main use case: compile the TVM-FFI
+kernel in a producer process, embed its object bytes in the JAX artifact, and
+load it in a consumer without the original kernel source or per-function
+registration. The [CuTe export/AOT example](examples/cutedsl/README.md#export-and-aot-deployment)
+provides separate producer and consumer scripts for both artifact formats:
+
+| Artifact | Consumer behavior |
+|---|---|
+| `jax.export` program | Compile the exported StableHLO with XLA; reuse the embedded CuTe object. |
+| Serialized AOT executable | Load the compiled executable directly; reuse the embedded CuTe object. |
+
 Install this branch with CuTe DSL 4.9.0.dev1 and the ORCJIT 0.1.3 loader:
 
 ```bash
