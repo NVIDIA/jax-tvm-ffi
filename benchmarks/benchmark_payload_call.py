@@ -8,7 +8,9 @@ import argparse
 import gc
 import hashlib
 import importlib
+import platform
 import statistics
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -62,6 +64,10 @@ def _build_object(build_directory: Path, object_padding_bytes: int) -> bytes:
         functions=(_FUNCTION_NAME,),
         build_directory=str(build_directory / "object"),
         output="payload_call_benchmark.o",
+        # Standalone JIT objects cannot resolve libgcc's outlined atomic helpers.
+        extra_cflags=["-mno-outline-atomics"]
+        if sys.platform == "linux" and platform.machine() == "aarch64"
+        else [],
     )
     return Path(object_path).read_bytes()
 

@@ -32,7 +32,7 @@ def main() -> None:
             compiled = jax.jit(exported.call).lower(input_spec).compile()
         else:
             compiled = serialize_executable.deserialize_and_load(
-                *pickle.loads(args.artifact.read_bytes()), backend="gpu"
+                *pickle.loads(args.artifact.read_bytes()), backend="gpu", execution_devices=[gpu]
             )
 
     x = np.random.default_rng(0).standard_normal((32, 1024)).astype(np.float32)

@@ -4,6 +4,7 @@
 import gc
 import os
 import pickle
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -104,6 +105,10 @@ def object_bytes(tmp_path_factory):
         functions=_PAYLOAD_FUNCTIONS,
         build_directory=str(tmp_path / "build"),
         output="payload_call_test.o",
+        # Standalone JIT objects cannot resolve libgcc's outlined atomic helpers.
+        extra_cflags=["-mno-outline-atomics"]
+        if sys.platform == "linux" and platform.machine() == "aarch64"
+        else [],
     )
     return Path(object_path).read_bytes()
 

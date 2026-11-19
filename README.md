@@ -125,6 +125,8 @@ independently, including when they use the same object bytes.
 The native loader resolves C++ runtime symbols from the consuming process. It
 leaves ORCJIT's optional C++ runtime-library paths unset and does not perform
 the Python wrapper's compiler-specific runtime discovery.
+For standalone C++ objects on Linux AArch64, compile with
+`-mno-outline-atomics` to avoid dependencies on libgcc's non-exported atomic helpers.
 
 Creating the first payload-, object-, or serialized-function call for a
 platform initializes that JAX backend to satisfy state-type registration
