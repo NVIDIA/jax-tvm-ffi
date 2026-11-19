@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import gc
 import hashlib
 import importlib
@@ -68,15 +67,15 @@ def _build_object(build_directory: Path, object_padding_bytes: int) -> bytes:
 
 
 def _benchmark_orcjit_loads(
-    payload: bytes, loader_name: str, samples: int
+    object_bytes: bytes, samples: int
 ) -> tuple[tvm_ffi.Module, tvm_ffi.Function, float, float, float, float]:
-    loader = tvm_ffi.get_global_func(loader_name)
+    loader = tvm_ffi.get_global_func("jax_tvm_ffi.LoadOrcjitObjectModule")
     load_times: list[float] = []
     lookup_times: list[float] = []
     direct_module = None
     direct_function = None
     for sample in range(samples + 1):
-        module, load_ns = _time_ns(lambda: loader(payload))
+        module, load_ns = _time_ns(lambda: loader(object_bytes))
         function, lookup_ns = _time_ns(lambda: module.get_function(_FUNCTION_NAME))
         if function is None:
             raise RuntimeError(f"Loaded module does not export {_FUNCTION_NAME!r}")
@@ -103,43 +102,30 @@ def _benchmark_call_factories(
     serialized: jax_tvm_ffi.SerializedFunction,
     result: jax.ShapeDtypeStruct,
     samples: int,
-    transport: str,
-) -> tuple[float, float | None]:
-    selected_times = []
+) -> tuple[float, float]:
+    object_times = []
     prehashed_times = []
     for _ in range(samples):
-        if transport == "raw":
-            _, duration_ns = _time_ns(
-                lambda: jax_tvm_ffi.ffi_call_from_payload(
-                    serialized.object_bytes,
-                    "jax_tvm_ffi.LoadOrcjitObjectModule",
-                    serialized.function_name,
-                    result,
-                    platform="cpu",
-                    arg_spec=("attrs.increment", "rets", "args"),
-                )
+        _, duration_ns = _time_ns(
+            lambda: jax_tvm_ffi.ffi_call_from_object(
+                serialized.object_bytes,
+                serialized.function_name,
+                result,
+                platform="cpu",
+                arg_spec=("attrs.increment", "rets", "args"),
             )
-        else:
-            _, duration_ns = _time_ns(
-                lambda: jax_tvm_ffi.ffi_call_from_object(
-                    serialized.object_bytes,
-                    serialized.function_name,
-                    result,
-                    platform="cpu",
-                    arg_spec=("attrs.increment", "rets", "args"),
-                )
+        )
+        _, prehashed_ns = _time_ns(
+            lambda: jax_tvm_ffi.ffi_call_from_serialized(
+                serialized,
+                result,
+                platform="cpu",
+                arg_spec=("attrs.increment", "rets", "args"),
             )
-            _, prehashed_ns = _time_ns(
-                lambda: jax_tvm_ffi.ffi_call_from_serialized(
-                    serialized,
-                    result,
-                    platform="cpu",
-                    arg_spec=("attrs.increment", "rets", "args"),
-                )
-            )
-            prehashed_times.append(prehashed_ns / 1_000)
-        selected_times.append(duration_ns / 1_000)
-    return _median(selected_times), _median(prehashed_times) if prehashed_times else None
+        )
+        object_times.append(duration_ns / 1_000)
+        prehashed_times.append(prehashed_ns / 1_000)
+    return _median(object_times), _median(prehashed_times)
 
 
 def _compile_once(
@@ -294,7 +280,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--load-samples", type=int, default=15)
     parser.add_argument("--loop-iterations", type=int, default=20_000)
     parser.add_argument("--object-padding-bytes", type=int, default=0)
-    parser.add_argument("--transport", choices=("base64", "raw"), default="base64")
     return parser.parse_args()
 
 
@@ -323,12 +308,6 @@ def main() -> None:
     cpu_device = jax.devices("cpu")[0]
     with tempfile.TemporaryDirectory(prefix="jax_tvm_ffi_benchmark_") as temporary_directory:
         object_bytes = _build_object(Path(temporary_directory), args.object_padding_bytes)
-        if args.transport == "base64":
-            transported_payload = base64.b64encode(object_bytes)
-            loader_name = "jax_tvm_ffi.LoadOrcjitBase64ObjectModule"
-        else:
-            transported_payload = object_bytes
-            loader_name = "jax_tvm_ffi.LoadOrcjitObjectModule"
         (
             _direct_module,
             direct_function,
@@ -336,7 +315,7 @@ def main() -> None:
             first_lookup_us,
             fresh_load_us,
             fresh_lookup_us,
-        ) = _benchmark_orcjit_loads(transported_payload, loader_name, args.load_samples)
+        ) = _benchmark_orcjit_loads(object_bytes, args.load_samples)
         jax_tvm_ffi.register_ffi_target(
             _DIRECT_TARGET,
             direct_function,
@@ -351,25 +330,15 @@ def main() -> None:
                 lambda: jax_tvm_ffi.SerializedFunction(object_bytes, _FUNCTION_NAME)
             )
             serialized_construction_times.append(duration_ns / 1_000)
-        selected_factory_us, prehashed_factory_us = _benchmark_call_factories(
-            serialized, result, args.load_samples, args.transport
+        object_factory_us, prehashed_factory_us = _benchmark_call_factories(
+            serialized, result, args.load_samples
         )
-        if args.transport == "base64":
-            payload_call = jax_tvm_ffi.ffi_call_from_serialized(
-                serialized,
-                result,
-                platform="cpu",
-                arg_spec=("attrs.increment", "rets", "args"),
-            )
-        else:
-            payload_call = jax_tvm_ffi.ffi_call_from_payload(
-                object_bytes,
-                "jax_tvm_ffi.LoadOrcjitObjectModule",
-                _FUNCTION_NAME,
-                result,
-                platform="cpu",
-                arg_spec=("attrs.increment", "rets", "args"),
-            )
+        payload_call = jax_tvm_ffi.ffi_call_from_serialized(
+            serialized,
+            result,
+            platform="cpu",
+            arg_spec=("attrs.increment", "rets", "args"),
+        )
         x = jax.device_put(np.zeros((1,), np.float32), cpu_device)
 
         compilation = _benchmark_compilation(direct_call, payload_call, x, args.compile_samples)
@@ -388,13 +357,10 @@ def main() -> None:
 
     print(f"platform: {jax.devices('cpu')[0].device_kind}")
     print(f"jax: {jax.__version__}")
-    print(f"transport: {args.transport}")
     print(f"object_bytes: {len(object_bytes)}")
-    print(f"transported_payload_bytes: {len(transported_payload)}")
     print(f"serialized_function_construct_us: {_median(serialized_construction_times):.3f}")
-    print(f"selected_call_factory_us: {selected_factory_us:.3f}")
-    if prehashed_factory_us is not None:
-        print(f"prehashed_call_factory_us: {prehashed_factory_us:.3f}")
+    print(f"object_call_factory_us: {object_factory_us:.3f}")
+    print(f"prehashed_call_factory_us: {prehashed_factory_us:.3f}")
     print(f"orcjit_first_module_add_us: {first_load_us:.3f}")
     print(f"orcjit_first_function_materialize_us: {first_lookup_us:.3f}")
     print(f"orcjit_warm_session_fresh_module_add_us: {fresh_load_us:.3f}")

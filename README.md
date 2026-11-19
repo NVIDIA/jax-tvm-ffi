@@ -114,12 +114,10 @@ Both versions are published on PyPI and pinned by the extras.
 With uv, use `uv sync --extra cutedsl --extra orcjit --prerelease allow` to
 enable CuTe DSL's transitive development dependencies.
 
-`ffi_call_from_object` embeds a native relocatable object and entry-point name
-in the StableHLO custom call. The object uses a base64 transport envelope that
-reduces PJRT executable expansion for binary attributes, then a native loader
-decodes it at executable instantiation before a shared TVM-FFI ORCJIT session
-loads it. JAX TVM FFI
-weakly interns the resulting module by loader and payload SHA-256, then resolves
+`ffi_call_from_object` embeds raw native object bytes and an entry-point name
+in the StableHLO custom call. At executable instantiation, a shared TVM-FFI
+ORCJIT session loads the object directly from memory. JAX TVM FFI weakly
+interns the resulting module by loader and payload SHA-256, then resolves
 the exported host launcher from that module. Each executable strongly owns the
 shared module, resolved function, and decoded argument mapping for every launch.
 The cache does not extend module lifetime, so a module can unload after its last

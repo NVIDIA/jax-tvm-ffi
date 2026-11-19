@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """JAX TVM FFI Python package."""
 
-import base64
 import hashlib
 import importlib
 import sys
@@ -42,7 +41,6 @@ _LIB = _load_lib()
 
 _PAYLOAD_TARGET = "jax_tvm_ffi.payload_call"
 _ORCJIT_OBJECT_LOADER = "jax_tvm_ffi.LoadOrcjitObjectModule"
-_ORCJIT_BASE64_OBJECT_LOADER = "jax_tvm_ffi.LoadOrcjitBase64ObjectModule"
 _ORCJIT_REQUIRED_GLOBALS = (
     "tvm_ffi_orcjit.GlobalDefaultSession",
     "tvm_ffi_orcjit.SessionLoadModule",
@@ -64,11 +62,6 @@ _registered_payload_targets: set[str] = set()
 tvm_ffi.register_global_func(
     _ORCJIT_OBJECT_LOADER,
     _LIB.load_orcjit_object_module,
-    override=True,
-)
-tvm_ffi.register_global_func(
-    _ORCJIT_BASE64_OBJECT_LOADER,
-    _LIB.load_orcjit_base64_object_module,
     override=True,
 )
 
@@ -350,17 +343,17 @@ def ffi_call_from_object(
 ) -> Callable[..., Any]:
     """Build a JAX FFI call backed by an in-memory native object file.
 
-    The object is base64-encoded to reduce PJRT executable expansion for binary
-    attributes. At executable instantiation, the native bridge decodes it and
-    TVM-FFI ORCJIT loads it directly from memory. JAX TVM FFI weakly interns the
-    module by object SHA-256 and resolves ``function_name`` from it.
+    The object bytes are embedded directly in a StableHLO custom-call attribute.
+    At executable instantiation, TVM-FFI ORCJIT loads them from memory. JAX TVM FFI
+    weakly interns the module by object SHA-256 and resolves ``function_name``
+    from it.
     """
     _require_orcjit()
     if not isinstance(object_bytes, bytes) or not object_bytes:
         raise ValueError("object_bytes must be nonempty bytes")
     return _ffi_call_from_payload(
-        base64.b64encode(object_bytes),
-        _ORCJIT_BASE64_OBJECT_LOADER,
+        object_bytes,
+        _ORCJIT_OBJECT_LOADER,
         function_name,
         result_shape_dtypes,
         payload_sha256=hashlib.sha256(object_bytes).hexdigest(),
@@ -396,8 +389,8 @@ def ffi_call_from_serialized(
         raise TypeError("serialized_function must be a SerializedFunction")
     _require_orcjit()
     return _ffi_call_from_payload(
-        base64.b64encode(serialized_function.object_bytes),
-        _ORCJIT_BASE64_OBJECT_LOADER,
+        serialized_function.object_bytes,
+        _ORCJIT_OBJECT_LOADER,
         serialized_function.function_name,
         result_shape_dtypes,
         payload_sha256=serialized_function.sha256,

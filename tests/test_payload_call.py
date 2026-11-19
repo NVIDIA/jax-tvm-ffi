@@ -319,7 +319,7 @@ numpy.testing.assert_equal(numpy.asarray(compiled(x)), numpy.asarray(x + 2))
 
 def test_object_entry_points_share_module_cache(object_bytes, request):
     jax_tvm_ffi.clear_payload_module_cache()
-    loader_name = "jax_tvm_ffi.LoadOrcjitBase64ObjectModule"
+    loader_name = "jax_tvm_ffi.LoadOrcjitObjectModule"
     original_loader = tvm_ffi.get_global_func(loader_name)
     load_count = 0
 
@@ -327,6 +327,7 @@ def test_object_entry_points_share_module_cache(object_bytes, request):
     def tracked_loader(payload_bytes):
         nonlocal load_count
         load_count += 1
+        assert bytes(payload_bytes) == object_bytes
         return original_loader(payload_bytes)
 
     def cleanup():
@@ -373,13 +374,6 @@ def test_serialized_function_call_reuses_digest(object_bytes, monkeypatch, reque
         numpy.asarray(jax.jit(lambda value: call(value, increment=2))(x)),
         numpy.asarray(x + 2),
     )
-
-
-@pytest.mark.parametrize("payload", [b"!!!!", b"AAA", b"A==="])
-def test_base64_object_loader_rejects_invalid_payload(payload):
-    loader = tvm_ffi.get_global_func("jax_tvm_ffi.LoadOrcjitBase64ObjectModule")
-    with pytest.raises(Exception, match="Invalid base64 object payload"):
-        loader(payload)
 
 
 def test_payload_call_rejects_missing_export(payload_module, request):
