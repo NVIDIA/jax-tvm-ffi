@@ -1132,17 +1132,17 @@ struct PayloadCallAttributes {
 xla::ffi::ErrorOr<PayloadCallAttributes> DecodePayloadCallAttributes(
     const xla::ffi::Dictionary& attrs) {
   auto payload = attrs.get<std::string_view>("payload");
-  if (!payload) return std::move(payload).error();
+  if (!payload) return xla::ffi::Unexpected(std::move(payload).error());
   auto payload_loader = attrs.get<std::string_view>("payload_loader");
-  if (!payload_loader) return std::move(payload_loader).error();
+  if (!payload_loader) return xla::ffi::Unexpected(std::move(payload_loader).error());
   auto function_name = attrs.get<std::string_view>("function_name");
-  if (!function_name) return std::move(function_name).error();
+  if (!function_name) return xla::ffi::Unexpected(std::move(function_name).error());
   auto arg_spec = attrs.get<std::string_view>("arg_spec");
-  if (!arg_spec) return std::move(arg_spec).error();
+  if (!arg_spec) return xla::ffi::Unexpected(std::move(arg_spec).error());
   auto device_type = attrs.get<int64_t>("device_type");
-  if (!device_type) return std::move(device_type).error();
+  if (!device_type) return xla::ffi::Unexpected(std::move(device_type).error());
   auto num_workspace_outputs = attrs.get<int64_t>("num_workspace_outputs");
-  if (!num_workspace_outputs) return std::move(num_workspace_outputs).error();
+  if (!num_workspace_outputs) return xla::ffi::Unexpected(std::move(num_workspace_outputs).error());
   return PayloadCallAttributes{*payload,  *payload_loader, *function_name,
                                *arg_spec, *device_type,    *num_workspace_outputs};
 }
@@ -1180,12 +1180,14 @@ template <int DeviceType>
 xla::ffi::ErrorOr<std::unique_ptr<PayloadCallState<DeviceType>>> InstantiatePayloadCall(
     xla::ffi::Dictionary attrs) {
   auto decoded = DecodePayloadCallAttributes(attrs);
-  if (!decoded) return std::move(decoded).error();
+  if (!decoded) return xla::ffi::Unexpected(std::move(decoded).error());
   if (decoded->device_type != DeviceType) {
-    return xla::ffi::Error::InvalidArgument("Payload device type does not match its FFI target");
+    return xla::ffi::Unexpected(
+        xla::ffi::Error::InvalidArgument("Payload device type does not match its FFI target"));
   }
   if (decoded->num_workspace_outputs < 0) {
-    return xla::ffi::Error::InvalidArgument("num_workspace_outputs must be nonnegative");
+    return xla::ffi::Unexpected(
+        xla::ffi::Error::InvalidArgument("num_workspace_outputs must be nonnegative"));
   }
 
   try {
@@ -1205,23 +1207,24 @@ xla::ffi::ErrorOr<std::unique_ptr<PayloadCallState<DeviceType>>> InstantiatePayl
         /*use_last_output_for_alloc_workspace=*/false, decoded->num_workspace_outputs);
     return std::make_unique<PayloadCallState<DeviceType>>(std::move(module), std::move(handler));
   } catch (const std::invalid_argument& error) {
-    return xla::ffi::Error::InvalidArgument("Failed to load payload function '" +
-                                            std::string(decoded->function_name) +
-                                            "': " + error.what());
+    return xla::ffi::Unexpected(xla::ffi::Error::InvalidArgument(
+        "Failed to load payload function '" + std::string(decoded->function_name) +
+        "': " + error.what()));
   } catch (const tvm::ffi::Error& error) {
     std::string message = "Failed to load payload function '" +
                           std::string(decoded->function_name) + "': " + error.what();
     if (error.kind() == "TypeError" || error.kind() == "ValueError") {
-      return xla::ffi::Error::InvalidArgument(std::move(message));
+      return xla::ffi::Unexpected(xla::ffi::Error::InvalidArgument(std::move(message)));
     }
-    return xla::ffi::Error::Internal(std::move(message));
+    return xla::ffi::Unexpected(xla::ffi::Error::Internal(std::move(message)));
   } catch (const std::exception& error) {
-    return xla::ffi::Error::Internal("Failed to load payload function '" +
-                                     std::string(decoded->function_name) + "': " + error.what());
+    return xla::ffi::Unexpected(xla::ffi::Error::Internal("Failed to load payload function '" +
+                                                          std::string(decoded->function_name) +
+                                                          "': " + error.what()));
   } catch (...) {
-    return xla::ffi::Error::Internal("Failed to load payload function '" +
-                                     std::string(decoded->function_name) +
-                                     "': loader raised an unknown exception");
+    return xla::ffi::Unexpected(xla::ffi::Error::Internal("Failed to load payload function '" +
+                                                          std::string(decoded->function_name) +
+                                                          "': loader raised an unknown exception"));
   }
 }
 

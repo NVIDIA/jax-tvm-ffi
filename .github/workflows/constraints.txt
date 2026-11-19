@@ -1,1 +1,1 @@
-apache-tvm-ffi==0.1.10
+apache-tvm-ffi==0.1.16
