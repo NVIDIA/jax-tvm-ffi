@@ -120,6 +120,7 @@ def softmax(x: Array) -> Array:
 
 def main() -> None:
     """Demonstrate serialized CuTe DSL softmax integration with JAX."""
+    jax_tvm_ffi.register_payload_target(platform="gpu")
     print("=" * 60)
     print("Serialized CuTe DSL Softmax + JAX Integration Demo")
     print("=" * 60)

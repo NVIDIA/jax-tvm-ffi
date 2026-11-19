@@ -45,12 +45,14 @@ _PAYLOAD_CPP_SOURCE = r"""
 _PAYLOAD_FUNCTIONS = ("add", "subtract")
 
 
-def test_payload_target_registers_before_backend_initialization():
+def test_payload_call_construction_defers_backend_initialization_until_registration():
     script = """
 import jax
 import jax.numpy as jnp
 import jax_tvm_ffi
+from jax._src import xla_bridge
 
+assert not xla_bridge.backends_are_initialized()
 call = jax_tvm_ffi.ffi_call_from_payload(
     b"payload",
     "missing.Loader",
@@ -58,6 +60,8 @@ call = jax_tvm_ffi.ffi_call_from_payload(
     jax.ShapeDtypeStruct((1,), jnp.float32),
     platform="cpu",
 )
+assert not xla_bridge.backends_are_initialized()
+jax_tvm_ffi.register_payload_target(platform="cpu")
 try:
     jax.jit(call)(jnp.zeros((1,), jnp.float32))
 except Exception as error:
@@ -69,6 +73,11 @@ else:
     environment = os.environ.copy()
     environment["JAX_PLATFORMS"] = "cpu"
     subprocess.run([sys.executable, "-c", script], check=True, env=environment)
+
+
+@pytest.fixture(scope="module")
+def payload_target():
+    return jax_tvm_ffi.register_payload_target(platform="cpu")
 
 
 @pytest.mark.parametrize("object_bytes", [b"", bytearray(b"object"), "object", None])
@@ -113,7 +122,9 @@ def object_bytes(tmp_path_factory):
     return Path(object_path).read_bytes()
 
 
-def test_payload_call_loads_once_per_instantiation_and_passes_workspace(payload_module, request):
+def test_payload_call_loads_once_per_instantiation_and_passes_workspace(
+    payload_target, payload_module, request
+):
     payload = b"payload-module"
     loader_name = "jax_tvm_ffi_test.LoadPayloadModule"
     load_count = 0
@@ -182,7 +193,7 @@ def test_payload_call_loads_once_per_instantiation_and_passes_workspace(payload_
     assert load_count == 3
 
 
-def test_object_call_loads_orcjit_object(object_bytes):
+def test_object_call_loads_orcjit_object(payload_target, object_bytes):
     call = jax_tvm_ffi.ffi_call_from_object(
         object_bytes,
         "add",
@@ -198,7 +209,9 @@ def test_object_call_loads_orcjit_object(object_bytes):
 
 
 @pytest.mark.parametrize("artifact_format", ["export", "executable"])
-def test_object_round_trip_in_fresh_process(object_bytes, tmp_path, artifact_format):
+def test_object_round_trip_in_fresh_process(
+    payload_target, object_bytes, tmp_path, artifact_format
+):
     call = jax_tvm_ffi.ffi_call_from_object(
         object_bytes,
         "add",
@@ -212,11 +225,10 @@ def test_object_round_trip_in_fresh_process(object_bytes, tmp_path, artifact_for
     artifact_path = tmp_path / "artifact"
     if artifact_format == "export":
         pytest.importorskip("flatbuffers")
-        target = jax_tvm_ffi.register_payload_target(platform="cpu")
         exported = export.export(
             add_two,
             platforms=("cpu",),
-            disabled_checks=(export.DisabledSafetyCheck.custom_call(target),),
+            disabled_checks=(export.DisabledSafetyCheck.custom_call(payload_target),),
         )(input_spec)
         artifact_path.write_bytes(exported.serialize())
     else:
@@ -260,7 +272,7 @@ numpy.testing.assert_equal(numpy.asarray(compiled(x)), numpy.asarray(x + 2))
     )
 
 
-def test_object_entry_points_own_independent_modules(object_bytes, request):
+def test_object_entry_points_own_independent_modules(payload_target, object_bytes, request):
     loader_name = "jax_tvm_ffi.LoadOrcjitObjectModule"
     original_loader = tvm_ffi.get_global_func(loader_name)
     load_count = 0
@@ -302,7 +314,7 @@ def test_object_entry_points_own_independent_modules(object_bytes, request):
     assert load_count == 2
 
 
-def test_payload_call_rejects_missing_export(payload_module, request):
+def test_payload_call_rejects_missing_export(payload_target, payload_module, request):
     payload = b"missing-export-payload"
     loader_name = "jax_tvm_ffi_test.LoadMissingExportModule"
 

@@ -128,10 +128,11 @@ the Python wrapper's compiler-specific runtime discovery.
 For standalone C++ objects on Linux AArch64, compile with
 `-mno-outline-atomics` to avoid dependencies on libgcc's non-exported atomic helpers.
 
-Creating the first payload-, object-, or serialized-function call for a
-platform initializes that JAX backend to satisfy state-type registration
-ordering. Complete `jax.distributed.initialize()` and other backend
-configuration before constructing these calls.
+Call `jax_tvm_ffi.register_payload_target(platform=...)` once per platform in
+each process before compiling or loading a payload-backed computation.
+Registration initializes the selected JAX backend, so complete
+`jax.distributed.initialize()` and other backend configuration first. The call
+factories only construct calls and can be used before registration.
 
 CUTLASS DSL users can obtain CUDA object bytes and an exported name with
 `jax_tvm_ffi.cutlass.compile_to_object`. The helper uses
@@ -146,6 +147,7 @@ already-serialized executable without recompiling must call
 ```python
 from jax_tvm_ffi.cutlass import compile_to_object
 
+jax_tvm_ffi.register_payload_target(platform="gpu")
 serialized_function = compile_to_object(
     kernel,
     *compile_args,

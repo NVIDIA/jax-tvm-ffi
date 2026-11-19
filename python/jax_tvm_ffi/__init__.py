@@ -102,9 +102,10 @@ def _get_dl_device_type(platform: str) -> int:
 def register_payload_target(platform: str = "gpu") -> str:
     """Register the predefined target for loading payload-backed executables.
 
-    Call this in a fresh process before deserializing a compiled executable or
-    calling a deserialized JAX export. It registers the bridge and its state
-    type without requiring the original object bytes or Python callable.
+    Call this during process setup before compiling payload-backed calls,
+    deserializing a compiled executable, or calling a deserialized JAX export.
+    It registers the bridge and its state type without requiring the original
+    object bytes or Python callable.
     Repeated registration for the same platform is safe. Returns the target
     name, which can also be used with ``jax.export.DisabledSafetyCheck.custom_call``.
 
@@ -204,9 +205,9 @@ def ffi_call_from_payload(  # noqa: PLR0913
     returned JAX value, and passed to the loaded function as opaque pointers
     after its ordinary tensor arguments and results.
 
-    Constructing the first payload-backed call for a platform initializes that
-    JAX backend to satisfy state-type registration ordering. Complete distributed
-    initialization and backend configuration before creating the call.
+    Call :func:`register_payload_target` for the selected platform during process
+    setup before compiling or executing the call. Constructing the call does not
+    register the target or initialize a JAX backend.
     """
     if not isinstance(payload, bytes) or not payload:
         raise ValueError("payload must be nonempty bytes")
@@ -220,7 +221,7 @@ def ffi_call_from_payload(  # noqa: PLR0913
         raise ValueError("output_layouts must describe only the visible results")
     encoded_arg_spec, expected_attr_names = _encode_arg_spec(arg_spec)
 
-    target = register_payload_target(platform)
+    device_type = int(_get_dl_device_type(platform))
     result_leaves, result_tree = jax.tree.flatten(result_shape_dtypes)
     workspace_results = tuple(
         jax.ShapeDtypeStruct((workspace.size_in_bytes,), jnp.uint8) for workspace in workspaces
@@ -231,7 +232,7 @@ def ffi_call_from_payload(  # noqa: PLR0913
         all_output_layouts = (*output_layouts, *((0,) for _ in workspaces))
 
     call = jax.ffi.ffi_call(
-        target,
+        _PAYLOAD_TARGET,
         all_results,
         vmap_method=vmap_method,
         input_layouts=input_layouts,
@@ -253,7 +254,7 @@ def ffi_call_from_payload(  # noqa: PLR0913
             payload=payload,
             payload_loader=payload_loader,
             function_name=function_name,
-            device_type=int(_get_dl_device_type(platform)),
+            device_type=device_type,
             num_workspace_outputs=len(workspaces),
         )
         visible_results = tuple(results[: len(result_leaves)])
@@ -299,6 +300,9 @@ def ffi_call_from_object(
     At custom-call instantiation, TVM-FFI ORCJIT loads them from memory and the
     bridge resolves ``function_name``. The call state retains the module and
     function for the executable's lifetime.
+
+    Call :func:`register_payload_target` during process setup before compiling
+    or executing the call.
     """
     _require_orcjit()
     if not isinstance(object_bytes, bytes) or not object_bytes:
@@ -335,6 +339,9 @@ def ffi_call_from_serialized(
     This is the preferred launcher for :func:`jax_tvm_ffi.cutlass.compile_to_object`
     results. It passes the object's bytes and exported function name to
     :func:`ffi_call_from_object`.
+
+    Call :func:`register_payload_target` during process setup before compiling
+    or executing the call.
     """
     if not isinstance(serialized_function, SerializedFunction):
         raise TypeError("serialized_function must be a SerializedFunction")

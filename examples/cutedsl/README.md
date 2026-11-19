@@ -56,6 +56,11 @@ call
 `jax_tvm_ffi.cutlass.load_runtime()` when loading a previously serialized JAX
 executable in a fresh process without recompiling the kernel first.
 
+Call `jax_tvm_ffi.register_payload_target(platform="gpu")` during application
+setup before compiling or loading payload-backed computations. The call
+factories do not register the target. Registration initializes the JAX backend,
+so complete distributed initialization and backend configuration first.
+
 ## Export and AOT deployment
 
 The producer compiles a `(32, 1024)` float32 softmax and writes two artifacts.
@@ -84,7 +89,8 @@ allows the predefined `jax_tvm_ffi.payload_call` custom call via
 are the application's responsibility.
 
 The [consumer](run_exported_softmax.py) imports ORCJIT, loads the CuTe runtime,
-and registers the predefined payload target. It never imports `softmax.py` or
+and registers the predefined payload target. Both producer and consumer register
+the target explicitly during setup. The consumer never imports `softmax.py` or
 the producer's kernel-registration code. ORCJIT restores the function from the
 embedded object, and the consumer checks its result against NumPy. Neither
 consumer path recompiles the CuTe kernel. The `jax.export` path still compiles
