@@ -91,6 +91,126 @@ jax_tvm_ffi.register_ffi_target(
 result = jax.ffi.ffi_call("my.function", output_shape)(x, y, eps=1e-5)
 ```
 
+### Object-backed calls
+
+Export and ahead-of-time deployment are the main use case: compile the TVM-FFI
+kernel in a producer process, embed its object bytes in the JAX artifact, and
+load it in a consumer without the original kernel source or per-function
+registration. The [CuTe export/AOT example](examples/cutedsl/README.md#export-and-aot-deployment)
+provides separate producer and consumer scripts for both artifact formats:
+
+| Artifact | Consumer behavior |
+|---|---|
+| `jax.export` program | Compile the exported StableHLO with XLA; reuse the embedded CuTe object. |
+| Serialized AOT executable | Load the compiled executable directly; reuse the embedded CuTe object. |
+
+Install this branch with CuTe DSL 4.9.0.dev1 and the ORCJIT 0.1.3 loader:
+
+```bash
+pip install -e ".[cutedsl,orcjit]"
+```
+
+Both versions are published on PyPI and pinned by the extras.
+With uv, use `uv sync --extra cutedsl --extra orcjit --prerelease allow` to
+enable CuTe DSL's transitive development dependencies.
+
+`ffi_call_from_object` embeds raw native object bytes and an entry-point name
+in the StableHLO custom call. At executable instantiation, a shared TVM-FFI
+ORCJIT session loads the object directly from memory. Each custom-call
+instantiation loads its own module and resolves the exported host launcher.
+The call state retains the module, function, and decoded argument mapping for
+every launch until the executable is released. Separate call instances load
+independently, including when they use the same object bytes.
+
+The native loader resolves C++ runtime symbols from the consuming process. It
+leaves ORCJIT's optional C++ runtime-library paths unset and does not perform
+the Python wrapper's compiler-specific runtime discovery.
+For standalone C++ objects on Linux AArch64, compile with
+`-mno-outline-atomics` to avoid dependencies on libgcc's non-exported atomic helpers.
+
+Call `jax_tvm_ffi.register_payload_target(platform=...)` once per platform in
+each process before compiling or loading a payload-backed computation.
+Registration initializes the selected JAX backend, so complete
+`jax.distributed.initialize()` and other backend configuration first. The call
+factories only construct calls and can be used before registration.
+
+CUTLASS DSL users can obtain CUDA object bytes and an exported name with
+`jax_tvm_ffi.cutlass.compile_to_object`. The helper uses
+`cute.compile[EnableTVMFFI]`, then asks the returned compiled handle for its
+object bytes. CuTe DSL 4.9.0.dev1 includes object dumping and exports
+`__tvm_ffi_module_init` while retaining the kernel's lazy CUDA initialization.
+The helper loads the CuTe runtime libraries with process-global symbol
+visibility and retains them for module teardown. A process that consumes an
+already-serialized executable without recompiling must call
+`jax_tvm_ffi.cutlass.load_runtime()` first.
+
+```python
+from jax_tvm_ffi.cutlass import compile_to_object
+
+jax_tvm_ffi.register_payload_target(platform="gpu")
+serialized_function = compile_to_object(
+    kernel,
+    *compile_args,
+    compile_options="--preserve-line-info --opt-level 2",
+)
+call = jax_tvm_ffi.ffi_call_from_serialized(
+    serialized_function,
+    jax.ShapeDtypeStruct(output_shape, jnp.float32),
+    platform="gpu",
+    arg_spec=("args", "rets", "attrs.scale"),
+    workspaces=(jax_tvm_ffi.Workspace(workspace_size),),
+)
+result = jax.jit(lambda x: call(x, scale=scale))(input)
+```
+
+The object contains a TVM-FFI host export that lazily initializes and unloads
+its embedded device code, such as a CUBIN, plus the explicit
+`__tvm_ffi_module_init` entry. On Linux this is an ELF relocatable object;
+ORCJIT also accepts the native object format on macOS and Windows.
+`ffi_call_from_payload` remains
+available for other serialized formats through a registered loader with
+signature `(Bytes) -> Module`.
+
+Workspaces are trailing `uint8` outputs owned by XLA. They are hidden from the
+Python result and passed to the loaded function as opaque pointers after its
+ordinary input and output tensors. This is separate from
+`use_last_output_for_alloc_workspace`, which provides TVM FFI's allocation
+arena and does not pass the arena itself to the function.
+
+#### Loading in a fresh process
+
+Before deserializing a compiled executable, initialize the loader and register
+the predefined target on the consuming platform:
+
+```python
+import jax_tvm_ffi
+import tvm_ffi_orcjit
+from jax.experimental import serialize_executable
+
+jax_tvm_ffi.register_payload_target(platform="gpu")
+# For objects compiled by CuTe DSL, also load its runtime libraries:
+from jax_tvm_ffi.cutlass import load_runtime
+load_runtime()
+
+compiled = serialize_executable.deserialize_and_load(
+    serialized_executable, in_tree, out_tree, backend="gpu"
+)
+result = compiled(input)
+```
+
+The producer obtains `serialized_executable`, `in_tree`, and `out_tree` from
+`serialize_executable.serialize(compiled)`. The executable contains the object
+bytes and function name, so the consumer does not need the original compiler,
+Python kernel, or per-function target registration. The consuming environment
+must support the object's native architecture and runtime dependencies.
+
+`register_payload_target` is idempotent and initializes the chosen backend;
+call it after distributed initialization and backend configuration. For custom
+payload formats, register their TVM global loader in place of importing
+`tvm_ffi_orcjit`. For `jax.export`, pass
+`jax.export.DisabledSafetyCheck.custom_call("jax_tvm_ffi.payload_call")` through
+`export`'s `disabled_checks` argument and initialize the consumer the same way.
+
 ### Python Callback
 
 Because `tvm_ffi` supports Python functions out of the box, you can use the same

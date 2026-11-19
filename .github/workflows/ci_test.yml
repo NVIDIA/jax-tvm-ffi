@@ -49,7 +49,7 @@ jobs:
         include:
           - {os: ubuntu-latest, arch: x86_64, python_version: '3.12'}
           - {os: ubuntu-24.04-arm, arch: aarch64, python_version: '3.11'}
-          - {os: macos-14, arch: arm64, python_version: '3.13'}
+          - {os: macos-15, arch: arm64, python_version: '3.13'}
 
     steps:
       - uses: actions/checkout@v4
@@ -77,8 +77,8 @@ jobs:
           CMAKE_BUILD_PARALLEL_LEVEL: ${{ steps.env_vars.outputs.cpu_count }}
           UV_CONSTRAINT: .github/workflows/constraints.txt
         run: |
-          uv pip install pytest numpy
-          uv pip install --reinstall --verbose .
+          uv pip install pytest numpy flatbuffers "apache-tvm-ffi[cpp]>=0.1.8.post2"
+          uv pip install --reinstall --verbose ".[orcjit]"
 
       # Run Python tests
       - name: Run tests

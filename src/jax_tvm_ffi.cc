@@ -4,16 +4,24 @@
 #include <tvm/ffi/c_api.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/container/variant.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/module.h>
 #include <tvm/ffi/function.h>
+#include <tvm/ffi/string.h>
 #include <xla/ffi/api/ffi.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -202,6 +210,8 @@ struct DecodeSpec {
   std::vector<DecodeItem> items;
   /*! \brief sorted attribute keys */
   std::vector<std::pair<std::string, size_t>> sorted_attr_keys;
+  /*! \brief call-frame index for each sorted attribute key */
+  std::vector<size_t> call_frame_attr_indices;
 };
 
 /*!
@@ -239,7 +249,11 @@ DecodeSpec ParseArgSpec(tvm::ffi::Array<tvm::ffi::String> arg_spec) {
   for (size_t i = 0; i < attr_keys.size(); ++i) {
     items[attr_keys[i].second].sorted_attr_index = i;
   }
-  return DecodeSpec{items, attr_keys};
+  std::vector<size_t> call_frame_attr_indices(attr_keys.size());
+  for (size_t i = 0; i < call_frame_attr_indices.size(); ++i) {
+    call_frame_attr_indices[i] = i;
+  }
+  return DecodeSpec{items, attr_keys, call_frame_attr_indices};
 }
 
 /*!
@@ -636,13 +650,18 @@ TVM_FFI_INLINE std::optional<tvm::ffi::Any> DecodeAttrArray(XLA_FFI_Array* array
 class JAXTVMFFIHandler : public xla::ffi::Ffi {
  public:
   JAXTVMFFIHandler(tvm::ffi::Function func, DecodeSpec decode_spec, int device_type, int traits,
-                   bool pass_owned_tensor, bool use_last_output_for_alloc_workspace)
+                   bool pass_owned_tensor, bool use_last_output_for_alloc_workspace,
+                   int64_t num_external_workspace_outputs = 0)
       : func_(func),
         decode_spec_(decode_spec),
         device_type_(device_type),
         traits_(traits),
         pass_owned_tensor_(pass_owned_tensor),
-        use_last_output_for_alloc_workspace_(use_last_output_for_alloc_workspace) {}
+        use_last_output_for_alloc_workspace_(use_last_output_for_alloc_workspace),
+        num_external_workspace_outputs_(num_external_workspace_outputs) {
+    TVM_FFI_ICHECK_GE(num_external_workspace_outputs_, 0);
+    TVM_FFI_ICHECK(!(use_last_output_for_alloc_workspace_ && num_external_workspace_outputs_ != 0));
+  }
 
   XLA_FFI_Error* Call(XLA_FFI_CallFrame* call_frame) const final {
     // If passed a call frame with the metadata extension, just return the
@@ -703,6 +722,10 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
           return MakeError(call_frame->api, XLA_FFI_Error_Code_INTERNAL, "Invalid decode kind");
         }
       }
+    }
+    if (XLA_FFI_Error* err = DecodeExternalWorkspaces(call_frame, &call_ctx);
+        XLA_FFI_PREDICT_FALSE(err)) {
+      return err;
     }
     // fill in shapes for FP4 tensors
     call_ctx.stack->FillShapesForFP4Tensors();
@@ -872,11 +895,16 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
   }
 
   XLA_FFI_Error* DecodeRets(const XLA_FFI_CallFrame* call_frame, CallContext* call_ctx) const {
-    // If use_last_output_for_alloc_workspace is true, skip the last buffer (which is the workspace)
-    int64_t num_rets_to_decode = call_frame->rets.size;
-    if (use_last_output_for_alloc_workspace_ && num_rets_to_decode > 0) {
-      num_rets_to_decode -= 1;
+    const int64_t hidden_ret_count =
+        num_external_workspace_outputs_ + (use_last_output_for_alloc_workspace_ ? 1 : 0);
+    if (XLA_FFI_PREDICT_FALSE(hidden_ret_count > call_frame->rets.size)) {
+      std::ostringstream msg;
+      msg << "Expected at least " << hidden_ret_count << " hidden workspace outputs, got "
+          << call_frame->rets.size << " total outputs";
+      return InvalidArgument(call_frame->api, msg.str());
     }
+
+    int64_t num_rets_to_decode = call_frame->rets.size - hidden_ret_count;
 
     for (int64_t i = 0; i < num_rets_to_decode; ++i) {
       if (XLA_FFI_PREDICT_FALSE(call_frame->rets.types[i] != XLA_FFI_RetType_BUFFER)) {
@@ -893,6 +921,29 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
       } else {
         call_ctx->stack->packed_args.emplace_back(call_ctx->stack->AllocTempOwnedTensor(dltensor));
       }
+    }
+
+    return Success();
+  }
+
+  XLA_FFI_Error* DecodeExternalWorkspaces(const XLA_FFI_CallFrame* call_frame,
+                                          CallContext* call_ctx) const {
+    if (XLA_FFI_PREDICT_FALSE(num_external_workspace_outputs_ > call_frame->rets.size)) {
+      std::ostringstream msg;
+      msg << "Expected at least " << num_external_workspace_outputs_
+          << " external workspace outputs, got " << call_frame->rets.size << " total outputs";
+      return InvalidArgument(call_frame->api, msg.str());
+    }
+    const int64_t workspace_start = call_frame->rets.size - num_external_workspace_outputs_;
+    for (int64_t i = workspace_start; i < call_frame->rets.size; ++i) {
+      if (XLA_FFI_PREDICT_FALSE(call_frame->rets.types[i] != XLA_FFI_RetType_BUFFER)) {
+        return InvalidArgument(call_frame->api, "Only support buffer workspace outputs");
+      }
+      auto* buffer = static_cast<XLA_FFI_Buffer*>(call_frame->rets.rets[i]);
+      if (XLA_FFI_PREDICT_FALSE(buffer->data == nullptr)) {
+        return InvalidArgument(call_frame->api, "Workspace output has a null data pointer");
+      }
+      call_ctx->stack->packed_args.emplace_back(buffer->data);
     }
     return Success();
   }
@@ -953,31 +1004,24 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
   TVM_FFI_INLINE XLA_FFI_Error* DecodeAttr(const XLA_FFI_CallFrame* call_frame,
                                            CallContext* call_ctx,
                                            const DecodeItem& decode_item) const {
-    // get the attribute name
-    XLA_FFI_AttrType attr_type = call_frame->attrs.types[decode_item.sorted_attr_index];
-    XLA_FFI_ByteSpan* attr_name = call_frame->attrs.names[decode_item.sorted_attr_index];
-    void* attr_value = call_frame->attrs.attrs[decode_item.sorted_attr_index];
-    // inline string comparison
-    auto str_eq = [](const XLA_FFI_ByteSpan* a, const std::string& b) {
-      if (XLA_FFI_PREDICT_FALSE(a->len != b.size())) {
-        return false;
-      }
-      for (size_t i = 0; i < a->len; ++i) {
-        if (XLA_FFI_PREDICT_FALSE(a->ptr[i] != b[i])) {
-          return false;
-        }
-      }
-      return true;
-    };
     const std::string& expected_attr_name =
         decode_spec_.sorted_attr_keys[decode_item.sorted_attr_index].first;
-    if (XLA_FFI_PREDICT_FALSE(!str_eq(attr_name, expected_attr_name))) {
+    const size_t attr_index = decode_spec_.call_frame_attr_indices[decode_item.sorted_attr_index];
+    if (XLA_FFI_PREDICT_FALSE(attr_index >= static_cast<size_t>(call_frame->attrs.size))) {
       std::ostringstream msg;
-      msg << "Attribute mismatch mismatch, "
-          << "expected `" << expected_attr_name << "`, actual `"
-          << std::string_view(attr_name->ptr, attr_name->len) << "`";
+      msg << "Missing attribute `" << expected_attr_name << "`";
       return InvalidArgument(call_frame->api, msg.str());
     }
+    const XLA_FFI_ByteSpan* attr_name = call_frame->attrs.names[attr_index];
+    if (XLA_FFI_PREDICT_FALSE(std::string_view(attr_name->ptr, attr_name->len) !=
+                              expected_attr_name)) {
+      std::ostringstream msg;
+      msg << "Expected attribute `" << expected_attr_name << "` at index " << attr_index
+          << ", got `" << std::string_view(attr_name->ptr, attr_name->len) << "`";
+      return InvalidArgument(call_frame->api, msg.str());
+    }
+    XLA_FFI_AttrType attr_type = call_frame->attrs.types[attr_index];
+    void* attr_value = call_frame->attrs.attrs[attr_index];
     tvm::ffi::Any attr_value_any;
     if (XLA_FFI_Error* err =
             DecodeAttrValue(call_frame, call_ctx, attr_type, attr_value, &attr_value_any);  //
@@ -1021,7 +1065,298 @@ class JAXTVMFFIHandler : public xla::ffi::Ffi {
   int traits_;
   bool pass_owned_tensor_;
   bool use_last_output_for_alloc_workspace_;
+  int64_t num_external_workspace_outputs_;
 };
+
+tvm::ffi::Array<tvm::ffi::String> DecodeArgSpec(std::string_view encoded_arg_spec) {
+  tvm::ffi::Array<tvm::ffi::String> arg_spec;
+  if (!encoded_arg_spec.empty() && encoded_arg_spec.back() == '\0') {
+    throw std::invalid_argument("arg_spec contains an empty trailing item");
+  }
+  size_t item_start = 0;
+  while (item_start < encoded_arg_spec.size()) {
+    size_t item_end = encoded_arg_spec.find('\0', item_start);
+    if (item_end == std::string_view::npos) {
+      item_end = encoded_arg_spec.size();
+    }
+    if (item_end == item_start) {
+      throw std::invalid_argument("arg_spec contains an empty item");
+    }
+    arg_spec.push_back(
+        tvm::ffi::String(encoded_arg_spec.data() + item_start, item_end - item_start));
+    item_start = item_end + 1;
+  }
+  return arg_spec;
+}
+
+namespace {
+
+tvm::ffi::Module LoadOrcjitObjectModule(const tvm::ffi::Bytes& object_bytes) {
+  std::optional<tvm::ffi::Function> default_session =
+      tvm::ffi::Function::GetGlobal("tvm_ffi_orcjit.GlobalDefaultSession");
+  std::optional<tvm::ffi::Function> load_module =
+      tvm::ffi::Function::GetGlobal("tvm_ffi_orcjit.SessionLoadModule");
+  if (!default_session.has_value() || !load_module.has_value()) {
+    throw std::invalid_argument(
+        "apache-tvm-ffi-orcjit does not support loading object bytes into a module");
+  }
+
+  tvm::ffi::ObjectRef session = (*default_session)().cast<tvm::ffi::ObjectRef>();
+  tvm::ffi::Array<tvm::ffi::Variant<tvm::ffi::String, tvm::ffi::Bytes>> objects{object_bytes};
+  // Resolve C++ runtime symbols from the process without selecting a host compiler.
+  return (*load_module)(session, objects, tvm::ffi::String(), nullptr, nullptr)
+      .cast<tvm::ffi::Module>();
+}
+
+tvm::ffi::Module LoadPayloadModule(std::string_view payload, std::string_view payload_loader) {
+  std::optional<tvm::ffi::Function> loader = tvm::ffi::Function::GetGlobal(payload_loader);
+  if (!loader.has_value()) {
+    throw std::invalid_argument("Payload loader '" + std::string(payload_loader) +
+                                "' is not registered");
+  }
+  tvm::ffi::Bytes payload_bytes(payload.data(), payload.size());
+  return (*loader)(payload_bytes).cast<tvm::ffi::Module>();
+}
+
+}  // namespace
+
+struct PayloadCallAttributes {
+  std::string_view payload;
+  std::string_view payload_loader;
+  std::string_view function_name;
+  std::string_view arg_spec;
+  int64_t device_type;
+  int64_t num_workspace_outputs;
+};
+
+xla::ffi::ErrorOr<PayloadCallAttributes> DecodePayloadCallAttributes(
+    const xla::ffi::Dictionary& attrs) {
+  auto payload = attrs.get<std::string_view>("payload");
+  if (!payload) return xla::ffi::Unexpected(std::move(payload).error());
+  auto payload_loader = attrs.get<std::string_view>("payload_loader");
+  if (!payload_loader) return xla::ffi::Unexpected(std::move(payload_loader).error());
+  auto function_name = attrs.get<std::string_view>("function_name");
+  if (!function_name) return xla::ffi::Unexpected(std::move(function_name).error());
+  auto arg_spec = attrs.get<std::string_view>("arg_spec");
+  if (!arg_spec) return xla::ffi::Unexpected(std::move(arg_spec).error());
+  auto device_type = attrs.get<int64_t>("device_type");
+  if (!device_type) return xla::ffi::Unexpected(std::move(device_type).error());
+  auto num_workspace_outputs = attrs.get<int64_t>("num_workspace_outputs");
+  if (!num_workspace_outputs) return xla::ffi::Unexpected(std::move(num_workspace_outputs).error());
+  return PayloadCallAttributes{*payload,  *payload_loader, *function_name,
+                               *arg_spec, *device_type,    *num_workspace_outputs};
+}
+
+void PrecomputePayloadAttributeIndices(DecodeSpec* decode_spec, const xla::ffi::Dictionary& attrs) {
+  for (size_t key_index = 0; key_index < decode_spec->sorted_attr_keys.size(); ++key_index) {
+    const std::string& expected_name = decode_spec->sorted_attr_keys[key_index].first;
+    size_t attr_index = 0;
+    for (std::string_view actual_name : attrs) {
+      if (actual_name == expected_name) {
+        decode_spec->call_frame_attr_indices[key_index] = attr_index;
+        break;
+      }
+      ++attr_index;
+    }
+    if (attr_index == attrs.size()) {
+      throw std::invalid_argument("Missing payload attribute '" + expected_name + "'");
+    }
+  }
+}
+
+template <int DeviceType>
+struct PayloadCallState {
+  static inline xla::ffi::TypeId id{};
+
+  PayloadCallState(tvm::ffi::Module module, std::unique_ptr<JAXTVMFFIHandler> handler)
+      : module(std::move(module)), handler(std::move(handler)) {}
+
+  // Destroy the handler before unloading the module that owns its function.
+  tvm::ffi::Module module;
+  std::unique_ptr<JAXTVMFFIHandler> handler;
+};
+
+template <int DeviceType>
+xla::ffi::ErrorOr<std::unique_ptr<PayloadCallState<DeviceType>>> InstantiatePayloadCall(
+    xla::ffi::Dictionary attrs) {
+  auto decoded = DecodePayloadCallAttributes(attrs);
+  if (!decoded) return xla::ffi::Unexpected(std::move(decoded).error());
+  if (decoded->device_type != DeviceType) {
+    return xla::ffi::Unexpected(
+        xla::ffi::Error::InvalidArgument("Payload device type does not match its FFI target"));
+  }
+  if (decoded->num_workspace_outputs < 0) {
+    return xla::ffi::Unexpected(
+        xla::ffi::Error::InvalidArgument("num_workspace_outputs must be nonnegative"));
+  }
+
+  try {
+    tvm::ffi::Module module = LoadPayloadModule(decoded->payload, decoded->payload_loader);
+    tvm::ffi::String function_name(decoded->function_name.data(), decoded->function_name.size());
+    tvm::ffi::Optional<tvm::ffi::Function> function =
+        module->GetFunction(function_name, /*query_imports=*/true);
+    if (!function.has_value()) {
+      throw std::invalid_argument("Payload module does not export TVM FFI function '" +
+                                  std::string(decoded->function_name) + "'");
+    }
+    DecodeSpec decode_spec = ParseArgSpec(DecodeArgSpec(decoded->arg_spec));
+    PrecomputePayloadAttributeIndices(&decode_spec, attrs);
+    auto handler = std::make_unique<JAXTVMFFIHandler>(
+        std::move(*function), std::move(decode_spec), DeviceType,
+        /*traits=*/0, /*pass_owned_tensor=*/false,
+        /*use_last_output_for_alloc_workspace=*/false, decoded->num_workspace_outputs);
+    return std::make_unique<PayloadCallState<DeviceType>>(std::move(module), std::move(handler));
+  } catch (const std::invalid_argument& error) {
+    return xla::ffi::Unexpected(xla::ffi::Error::InvalidArgument(
+        "Failed to load payload function '" + std::string(decoded->function_name) +
+        "': " + error.what()));
+  } catch (const tvm::ffi::Error& error) {
+    std::string message = "Failed to load payload function '" +
+                          std::string(decoded->function_name) + "': " + error.what();
+    if (error.kind() == "TypeError" || error.kind() == "ValueError") {
+      return xla::ffi::Unexpected(xla::ffi::Error::InvalidArgument(std::move(message)));
+    }
+    return xla::ffi::Unexpected(xla::ffi::Error::Internal(std::move(message)));
+  } catch (const std::exception& error) {
+    return xla::ffi::Unexpected(xla::ffi::Error::Internal("Failed to load payload function '" +
+                                                          std::string(decoded->function_name) +
+                                                          "': " + error.what()));
+  } catch (...) {
+    return xla::ffi::Unexpected(xla::ffi::Error::Internal("Failed to load payload function '" +
+                                                          std::string(decoded->function_name) +
+                                                          "': loader raised an unknown exception"));
+  }
+}
+
+using CpuPayloadCallState = PayloadCallState<kDLCPU>;
+using GpuPayloadCallState = PayloadCallState<kDLCUDA>;
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(JAXTVMFFICpuPayloadCallInstantiate, InstantiatePayloadCall<kDLCPU>,
+                              xla::ffi::Ffi::BindInstantiate().Attrs());
+XLA_FFI_DEFINE_HANDLER_SYMBOL(JAXTVMFFIGpuPayloadCallInstantiate, InstantiatePayloadCall<kDLCUDA>,
+                              xla::ffi::Ffi::BindInstantiate().Attrs());
+
+template <int DeviceType>
+class PayloadExecuteHandler : public xla::ffi::Ffi {
+ public:
+  XLA_FFI_Error* Call(XLA_FFI_CallFrame* call_frame) const final {
+    if (XLA_FFI_Error* error =
+            CheckStructSize(call_frame->api, "XLA_FFI_CallFrame", XLA_FFI_CallFrame_STRUCT_SIZE,
+                            call_frame->struct_size)) {
+      return error;
+    }
+
+    if (XLA_FFI_PREDICT_FALSE(call_frame->extension_start != nullptr &&
+                              call_frame->extension_start->type == XLA_FFI_Extension_Metadata)) {
+      return PopulateMetadata(call_frame->api, reinterpret_cast<XLA_FFI_Metadata_Extension*>(
+                                                   call_frame->extension_start));
+    }
+    if (XLA_FFI_PREDICT_FALSE(call_frame->stage != XLA_FFI_ExecutionStage_EXECUTE)) {
+      return InvalidArgument(call_frame->api, "Payload handler expected the execute stage");
+    }
+
+    XLA_FFI_State_Get_Args state_args;
+    state_args.struct_size = XLA_FFI_State_Get_Args_STRUCT_SIZE;
+    state_args.extension_start = nullptr;
+    state_args.ctx = call_frame->ctx;
+    state_args.stage = XLA_FFI_ExecutionStage_INSTANTIATE;
+    state_args.type_id = &PayloadCallState<DeviceType>::id;
+    state_args.state = nullptr;
+    if (XLA_FFI_Error* error = call_frame->api->XLA_FFI_State_Get(&state_args)) {
+      return error;
+    }
+    auto* state = static_cast<PayloadCallState<DeviceType>*>(state_args.state);
+    if (XLA_FFI_PREDICT_FALSE(state == nullptr || state->handler == nullptr)) {
+      return MakeError(call_frame->api, XLA_FFI_Error_Code_FAILED_PRECONDITION,
+                       "Payload call state was not instantiated");
+    }
+    return state->handler->Call(call_frame);
+  }
+
+ private:
+  XLA_FFI_Error* PopulateMetadata(const XLA_FFI_Api* api,
+                                  XLA_FFI_Metadata_Extension* extension) const {
+    if (XLA_FFI_Error* error = StructSizeIsGreaterOrEqual(api, "XLA_FFI_Metadata_Extension",
+                                                          XLA_FFI_Metadata_Extension_STRUCT_SIZE,
+                                                          extension->extension_base.struct_size)) {
+      return error;
+    }
+    if (XLA_FFI_Error* error =
+            StructSizeIsGreaterOrEqual(api, "XLA_FFI_Metadata", XLA_FFI_Metadata_STRUCT_SIZE,
+                                       extension->metadata->struct_size)) {
+      return error;
+    }
+    extension->metadata->api_version = XLA_FFI_Api_Version{
+        XLA_FFI_Api_Version_STRUCT_SIZE,
+        /*extension_start=*/nullptr,
+        XLA_FFI_API_MAJOR,
+        XLA_FFI_API_MINOR,
+    };
+    extension->metadata->traits = 0;
+    extension->metadata->state_type_id = XLA_FFI_UNKNOWN_TYPE_ID;
+    return nullptr;
+  }
+};
+
+template <int DeviceType>
+XLA_FFI_Error* RunPayloadExecuteHandler(XLA_FFI_CallFrame* call_frame) {
+  static const PayloadExecuteHandler<DeviceType> handler;
+  return handler.Call(call_frame);
+}
+
+extern "C" XLA_FFI_Error* JAXTVMFFICpuPayloadCallExecute(XLA_FFI_CallFrame* call_frame) {
+  return RunPayloadExecuteHandler<kDLCPU>(call_frame);
+}
+
+extern "C" XLA_FFI_Error* JAXTVMFFIGpuPayloadCallExecute(XLA_FFI_CallFrame* call_frame) {
+  return RunPayloadExecuteHandler<kDLCUDA>(call_frame);
+}
+
+template <int DeviceType>
+xla::ffi::TypeInfo* GetPayloadCallStateTypeInfo() {
+  static auto type_info = xla::ffi::MakeTypeInfo<PayloadCallState<DeviceType>>();
+  return &type_info;
+}
+
+void* PayloadCallInstantiateHandler(int64_t device_type) {
+  if (device_type == kDLCPU) {
+    return reinterpret_cast<void*>(&JAXTVMFFICpuPayloadCallInstantiate);
+  }
+  if (device_type == kDLCUDA) {
+    return reinterpret_cast<void*>(&JAXTVMFFIGpuPayloadCallInstantiate);
+  }
+  TVM_FFI_THROW(ValueError) << "Unsupported payload device type: " << device_type;
+}
+
+void* PayloadCallExecuteHandler(int64_t device_type) {
+  if (device_type == kDLCPU) {
+    return reinterpret_cast<void*>(&JAXTVMFFICpuPayloadCallExecute);
+  }
+  if (device_type == kDLCUDA) {
+    return reinterpret_cast<void*>(&JAXTVMFFIGpuPayloadCallExecute);
+  }
+  TVM_FFI_THROW(ValueError) << "Unsupported payload device type: " << device_type;
+}
+
+void* PayloadCallStateTypeId(int64_t device_type) {
+  if (device_type == kDLCPU) {
+    return &CpuPayloadCallState::id;
+  }
+  if (device_type == kDLCUDA) {
+    return &GpuPayloadCallState::id;
+  }
+  TVM_FFI_THROW(ValueError) << "Unsupported payload device type: " << device_type;
+}
+
+void* PayloadCallStateTypeInfo(int64_t device_type) {
+  if (device_type == kDLCPU) {
+    return GetPayloadCallStateTypeInfo<kDLCPU>();
+  }
+  if (device_type == kDLCUDA) {
+    return GetPayloadCallStateTypeInfo<kDLCUDA>();
+  }
+  TVM_FFI_THROW(ValueError) << "Unsupported payload device type: " << device_type;
+}
 
 //-------------------------------------------------------------------
 // global registry of handlers
@@ -1100,5 +1435,10 @@ size_t GetLastWorkspacePeak() { return WorkspaceAllocatorContext::GetThreadLocal
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(register_tvm_ffi_handler, JAXTVMFFIRegistry::Register);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(registered_count, JAXTVMFFIRegistry::RegisteredCount);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_last_workspace_peak, GetLastWorkspacePeak);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(load_orcjit_object_module, LoadOrcjitObjectModule);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(payload_call_instantiate_handler, PayloadCallInstantiateHandler);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(payload_call_execute_handler, PayloadCallExecuteHandler);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(payload_call_state_type_id, PayloadCallStateTypeId);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(payload_call_state_type_info, PayloadCallStateTypeInfo);
 
 }  // namespace jax_tvm_ffi

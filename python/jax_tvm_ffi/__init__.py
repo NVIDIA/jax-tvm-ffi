@@ -2,11 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """JAX TVM FFI Python package."""
 
+import importlib
 import sys
+import threading
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
+import jax
 import jax.ffi
+import jax.numpy as jnp
 import tvm_ffi
 
 
@@ -32,6 +38,56 @@ def _load_lib() -> tvm_ffi.Module:
 
 _LIB = _load_lib()
 
+_PAYLOAD_TARGET = "jax_tvm_ffi.payload_call"
+_ORCJIT_OBJECT_LOADER = "jax_tvm_ffi.LoadOrcjitObjectModule"
+_ORCJIT_REQUIRED_GLOBALS = (
+    "tvm_ffi_orcjit.GlobalDefaultSession",
+    "tvm_ffi_orcjit.SessionLoadModule",
+)
+_PAYLOAD_INTERNAL_ATTRS = frozenset(
+    {
+        "arg_spec",
+        "device_type",
+        "function_name",
+        "num_workspace_outputs",
+        "payload",
+        "payload_loader",
+    }
+)
+_payload_registration_lock = threading.Lock()
+_registered_payload_targets: set[str] = set()
+
+tvm_ffi.register_global_func(
+    _ORCJIT_OBJECT_LOADER,
+    _LIB.load_orcjit_object_module,
+    override=True,
+)
+
+
+@dataclass(frozen=True)
+class Workspace:
+    """A hidden device buffer passed to a payload function as an opaque pointer."""
+
+    size_in_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.size_in_bytes <= 0:
+            raise ValueError("Workspace size_in_bytes must be positive")
+
+
+@dataclass(frozen=True)
+class SerializedFunction:
+    """Native object bytes and exported TVM FFI function name."""
+
+    object_bytes: bytes
+    function_name: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.object_bytes, bytes) or not self.object_bytes:
+            raise ValueError("object_bytes must be nonempty bytes")
+        if not isinstance(self.function_name, str) or not self.function_name:
+            raise ValueError("function_name must be a nonempty string")
+
 
 def _get_dl_device_type(platform: str) -> int:
     """Get the dl device type from the platform."""
@@ -41,6 +97,266 @@ def _get_dl_device_type(platform: str) -> int:
         return tvm_ffi.DLDeviceType.kDLCUDA
     else:
         raise ValueError(f"Unsupported platform: {platform}")
+
+
+def register_payload_target(platform: str = "gpu") -> str:
+    """Register the predefined target for loading payload-backed executables.
+
+    Call this during process setup before compiling payload-backed calls,
+    deserializing a compiled executable, or calling a deserialized JAX export.
+    It registers the bridge and its state type without requiring the original
+    object bytes or Python callable.
+    Repeated registration for the same platform is safe. Returns the target
+    name, which can also be used with ``jax.export.DisabledSafetyCheck.custom_call``.
+
+    Import ``tvm_ffi_orcjit`` before loading object-backed executables. For a
+    custom payload format, register its TVM global loader instead. Load any
+    libraries required by the objects, such as the CuTe DSL runtime, as well.
+
+    This initializes the selected JAX backend. Complete distributed
+    initialization and backend configuration before calling this function.
+    """
+    device_type = int(_get_dl_device_type(platform))
+    target = _PAYLOAD_TARGET
+    with _payload_registration_lock:
+        if platform in _registered_payload_targets:
+            return target
+
+    # JAX replays queued FFI targets before queued FFI types when a backend is
+    # first created. Initialize it before registering this stateful target so
+    # the type is visible when the handler registration is applied.
+    jax.devices(platform)
+
+    with _payload_registration_lock:
+        if platform in _registered_payload_targets:
+            return target
+
+        jax.ffi.register_ffi_type(
+            f"jax_tvm_ffi.payload_call_state.{platform}",
+            {
+                "type_id": jax.ffi.pycapsule(_LIB.payload_call_state_type_id(device_type)),
+                "type_info": jax.ffi.pycapsule(_LIB.payload_call_state_type_info(device_type)),
+            },
+            platform=platform,
+        )
+        jax.ffi.register_ffi_target(
+            target,
+            {
+                "instantiate": jax.ffi.pycapsule(
+                    _LIB.payload_call_instantiate_handler(device_type)
+                ),
+                "execute": jax.ffi.pycapsule(_LIB.payload_call_execute_handler(device_type)),
+            },
+            platform=platform,
+        )
+        _registered_payload_targets.add(platform)
+    return target
+
+
+def _encode_arg_spec(arg_spec: Sequence[str] | None) -> tuple[str, frozenset[str]]:
+    items = tuple(arg_spec) if arg_spec is not None else ("args", "rets")
+    attr_names = set()
+    for item in items:
+        if not isinstance(item, str) or not item:
+            raise ValueError("arg_spec items must be nonempty strings")
+        if "\0" in item:
+            raise ValueError("arg_spec items cannot contain null characters")
+        if item in ("args", "rets", "ctx.stream"):
+            continue
+        if not item.startswith("attrs.") or len(item) == len("attrs."):
+            raise ValueError(
+                f"Invalid arg spec {item!r}; expected 'args', 'rets', 'ctx.stream', "
+                "or 'attrs.<key>'"
+            )
+        attr_name = item.removeprefix("attrs.")
+        if attr_name in _PAYLOAD_INTERNAL_ATTRS:
+            raise ValueError(f"arg_spec attribute {attr_name!r} is reserved")
+        attr_names.add(attr_name)
+    return "\0".join(items), frozenset(attr_names)
+
+
+def ffi_call_from_payload(  # noqa: PLR0913
+    payload: bytes,
+    payload_loader: str,
+    function_name: str,
+    result_shape_dtypes: Any,
+    *,
+    platform: str = "gpu",
+    arg_spec: Sequence[str] | None = None,
+    workspaces: Sequence[Workspace] = (),
+    vmap_method: str | None = None,
+    input_layouts: Sequence[Any] | None = None,
+    output_layouts: Sequence[Any] | None = None,
+    input_output_aliases: dict[int, int] | None = None,
+) -> Callable[..., Any]:
+    """Build a JAX FFI call whose executable owns its compiled payload.
+
+    ``payload_loader`` names a registered TVM global function with signature
+    ``(Bytes) -> Module``. Each custom-call instantiation loads a module and
+    resolves ``function_name``. Its state retains the module, resolved function,
+    and decoded argument specification for subsequent executions. Separate
+    call instances load independently.
+
+    ``arg_spec`` uses the same ``args``, ``rets``, ``attrs.<key>``, and
+    ``ctx.stream`` entries as :func:`register_ffi_target`. Keyword arguments to
+    the returned callable must exactly match its ``attrs.<key>`` entries.
+
+    Workspace buffers are appended to the custom call outputs, hidden from the
+    returned JAX value, and passed to the loaded function as opaque pointers
+    after its ordinary tensor arguments and results.
+
+    Call :func:`register_payload_target` for the selected platform during process
+    setup before compiling or executing the call. Constructing the call does not
+    register the target or initialize a JAX backend.
+    """
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("payload must be nonempty bytes")
+    if not payload_loader:
+        raise ValueError("payload_loader must be nonempty")
+    if not function_name:
+        raise ValueError("function_name must be nonempty")
+    if output_layouts is not None and len(output_layouts) != len(
+        jax.tree.leaves(result_shape_dtypes)
+    ):
+        raise ValueError("output_layouts must describe only the visible results")
+    encoded_arg_spec, expected_attr_names = _encode_arg_spec(arg_spec)
+
+    device_type = int(_get_dl_device_type(platform))
+    result_leaves, result_tree = jax.tree.flatten(result_shape_dtypes)
+    workspace_results = tuple(
+        jax.ShapeDtypeStruct((workspace.size_in_bytes,), jnp.uint8) for workspace in workspaces
+    )
+    all_results = (*result_leaves, *workspace_results)
+    all_output_layouts = None
+    if output_layouts is not None:
+        all_output_layouts = (*output_layouts, *((0,) for _ in workspaces))
+
+    call = jax.ffi.ffi_call(
+        _PAYLOAD_TARGET,
+        all_results,
+        vmap_method=vmap_method,
+        input_layouts=input_layouts,
+        output_layouts=all_output_layouts,
+        input_output_aliases=input_output_aliases,
+    )
+
+    def wrapped(*args: Any, **attrs: Any) -> Any:
+        if attrs.keys() != expected_attr_names:
+            missing = sorted(expected_attr_names - attrs.keys())
+            unexpected = sorted(attrs.keys() - expected_attr_names)
+            raise ValueError(
+                f"FFI attributes do not match arg_spec; missing={missing}, unexpected={unexpected}"
+            )
+        results = call(
+            *args,
+            **attrs,
+            arg_spec=encoded_arg_spec,
+            payload=payload,
+            payload_loader=payload_loader,
+            function_name=function_name,
+            device_type=device_type,
+            num_workspace_outputs=len(workspaces),
+        )
+        visible_results = tuple(results[: len(result_leaves)])
+        return jax.tree.unflatten(result_tree, visible_results)
+
+    return wrapped
+
+
+def _require_orcjit() -> None:
+    try:
+        importlib.import_module("tvm_ffi_orcjit")
+    except ImportError as error:
+        raise ImportError(
+            "Object-backed calls require apache-tvm-ffi-orcjit; install jax-tvm-ffi[orcjit]"
+        ) from error
+
+    if any(
+        tvm_ffi.get_global_func(name, allow_missing=True) is None
+        for name in _ORCJIT_REQUIRED_GLOBALS
+    ):
+        raise RuntimeError(
+            "The installed apache-tvm-ffi-orcjit does not support loading serialized object "
+            "bytes into the default execution session"
+        )
+
+
+def ffi_call_from_object(
+    object_bytes: bytes,
+    function_name: str,
+    result_shape_dtypes: Any,
+    *,
+    platform: str = "gpu",
+    arg_spec: Sequence[str] | None = None,
+    workspaces: Sequence[Workspace] = (),
+    vmap_method: str | None = None,
+    input_layouts: Sequence[Any] | None = None,
+    output_layouts: Sequence[Any] | None = None,
+    input_output_aliases: dict[int, int] | None = None,
+) -> Callable[..., Any]:
+    """Build a JAX FFI call backed by an in-memory native object file.
+
+    The object bytes are embedded directly in a StableHLO custom-call attribute.
+    At custom-call instantiation, TVM-FFI ORCJIT loads them from memory and the
+    bridge resolves ``function_name``. The call state retains the module and
+    function for the executable's lifetime.
+
+    Call :func:`register_payload_target` during process setup before compiling
+    or executing the call.
+    """
+    _require_orcjit()
+    if not isinstance(object_bytes, bytes) or not object_bytes:
+        raise ValueError("object_bytes must be nonempty bytes")
+    return ffi_call_from_payload(
+        object_bytes,
+        _ORCJIT_OBJECT_LOADER,
+        function_name,
+        result_shape_dtypes,
+        platform=platform,
+        arg_spec=arg_spec,
+        workspaces=workspaces,
+        vmap_method=vmap_method,
+        input_layouts=input_layouts,
+        output_layouts=output_layouts,
+        input_output_aliases=input_output_aliases,
+    )
+
+
+def ffi_call_from_serialized(
+    serialized_function: SerializedFunction,
+    result_shape_dtypes: Any,
+    *,
+    platform: str = "gpu",
+    arg_spec: Sequence[str] | None = None,
+    workspaces: Sequence[Workspace] = (),
+    vmap_method: str | None = None,
+    input_layouts: Sequence[Any] | None = None,
+    output_layouts: Sequence[Any] | None = None,
+    input_output_aliases: dict[int, int] | None = None,
+) -> Callable[..., Any]:
+    """Build a JAX FFI call from a serialized native object.
+
+    This is the preferred launcher for :func:`jax_tvm_ffi.cutlass.compile_to_object`
+    results. It passes the object's bytes and exported function name to
+    :func:`ffi_call_from_object`.
+
+    Call :func:`register_payload_target` during process setup before compiling
+    or executing the call.
+    """
+    if not isinstance(serialized_function, SerializedFunction):
+        raise TypeError("serialized_function must be a SerializedFunction")
+    return ffi_call_from_object(
+        serialized_function.object_bytes,
+        serialized_function.function_name,
+        result_shape_dtypes,
+        platform=platform,
+        arg_spec=arg_spec,
+        workspaces=workspaces,
+        vmap_method=vmap_method,
+        input_layouts=input_layouts,
+        output_layouts=output_layouts,
+        input_output_aliases=input_output_aliases,
+    )
 
 
 def register_ffi_target(
