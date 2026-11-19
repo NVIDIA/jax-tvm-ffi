@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """JAX TVM FFI Python package."""
 
-import hashlib
 import importlib
 import sys
 import threading
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -53,7 +52,6 @@ _PAYLOAD_INTERNAL_ATTRS = frozenset(
         "num_workspace_outputs",
         "payload",
         "payload_loader",
-        "payload_sha256",
     }
 )
 _payload_registration_lock = threading.Lock()
@@ -79,28 +77,16 @@ class Workspace:
 
 @dataclass(frozen=True)
 class SerializedFunction:
-    """Native object bytes, exported TVM FFI function name, and object digest."""
+    """Native object bytes and exported TVM FFI function name."""
 
     object_bytes: bytes
     function_name: str
-    sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_bytes, bytes) or not self.object_bytes:
             raise ValueError("object_bytes must be nonempty bytes")
         if not isinstance(self.function_name, str) or not self.function_name:
             raise ValueError("function_name must be a nonempty string")
-        object.__setattr__(self, "sha256", hashlib.sha256(self.object_bytes).hexdigest())
-
-
-def clear_payload_module_cache() -> int:
-    """Invalidate process-wide payload-module lookup entries.
-
-    Returns the number of reusable live lookup entries invalidated. The cache
-    holds modules weakly, so module lifetime follows live JAX executables. Loads
-    already in progress are not counted and cannot repopulate the cleared cache.
-    """
-    return int(_LIB.clear_payload_module_cache())
 
 
 def _get_dl_device_type(platform: str) -> int:
@@ -188,13 +174,12 @@ def _encode_arg_spec(arg_spec: Sequence[str] | None) -> tuple[str, frozenset[str
     return "\0".join(items), frozenset(attr_names)
 
 
-def _ffi_call_from_payload(  # noqa: PLR0913
+def ffi_call_from_payload(  # noqa: PLR0913
     payload: bytes,
     payload_loader: str,
     function_name: str,
     result_shape_dtypes: Any,
     *,
-    payload_sha256: str,
     platform: str = "gpu",
     arg_spec: Sequence[str] | None = None,
     workspaces: Sequence[Workspace] = (),
@@ -203,6 +188,26 @@ def _ffi_call_from_payload(  # noqa: PLR0913
     output_layouts: Sequence[Any] | None = None,
     input_output_aliases: dict[int, int] | None = None,
 ) -> Callable[..., Any]:
+    """Build a JAX FFI call whose executable owns its compiled payload.
+
+    ``payload_loader`` names a registered TVM global function with signature
+    ``(Bytes) -> Module``. Each custom-call instantiation loads a module and
+    resolves ``function_name``. Its state retains the module, resolved function,
+    and decoded argument specification for subsequent executions. Separate
+    call instances load independently.
+
+    ``arg_spec`` uses the same ``args``, ``rets``, ``attrs.<key>``, and
+    ``ctx.stream`` entries as :func:`register_ffi_target`. Keyword arguments to
+    the returned callable must exactly match its ``attrs.<key>`` entries.
+
+    Workspace buffers are appended to the custom call outputs, hidden from the
+    returned JAX value, and passed to the loaded function as opaque pointers
+    after its ordinary tensor arguments and results.
+
+    Constructing the first payload-backed call for a platform initializes that
+    JAX backend to satisfy state-type registration ordering. Complete distributed
+    initialization and backend configuration before creating the call.
+    """
     if not isinstance(payload, bytes) or not payload:
         raise ValueError("payload must be nonempty bytes")
     if not payload_loader:
@@ -247,7 +252,6 @@ def _ffi_call_from_payload(  # noqa: PLR0913
             arg_spec=encoded_arg_spec,
             payload=payload,
             payload_loader=payload_loader,
-            payload_sha256=payload_sha256,
             function_name=function_name,
             device_type=int(_get_dl_device_type(platform)),
             num_workspace_outputs=len(workspaces),
@@ -256,58 +260,6 @@ def _ffi_call_from_payload(  # noqa: PLR0913
         return jax.tree.unflatten(result_tree, visible_results)
 
     return wrapped
-
-
-def ffi_call_from_payload(  # noqa: PLR0913
-    payload: bytes,
-    payload_loader: str,
-    function_name: str,
-    result_shape_dtypes: Any,
-    *,
-    platform: str = "gpu",
-    arg_spec: Sequence[str] | None = None,
-    workspaces: Sequence[Workspace] = (),
-    vmap_method: str | None = None,
-    input_layouts: Sequence[Any] | None = None,
-    output_layouts: Sequence[Any] | None = None,
-    input_output_aliases: dict[int, int] | None = None,
-) -> Callable[..., Any]:
-    """Build a JAX FFI call whose executable owns its compiled payload.
-
-    ``payload_loader`` names a registered TVM global function with signature
-    ``(Bytes) -> Module``. Modules are weakly interned by loader and payload
-    SHA-256, then ``function_name`` is resolved from the shared module when an
-    executable is instantiated. The module, resolved function, and decoded
-    argument specification are owned by that executable.
-
-    ``arg_spec`` uses the same ``args``, ``rets``, ``attrs.<key>``, and
-    ``ctx.stream`` entries as :func:`register_ffi_target`. Keyword arguments to
-    the returned callable must exactly match its ``attrs.<key>`` entries.
-
-    Workspace buffers are appended to the custom call outputs, hidden from the
-    returned JAX value, and passed to the loaded function as opaque pointers
-    after its ordinary tensor arguments and results.
-
-    Constructing the first payload-backed call for a platform initializes that
-    JAX backend to satisfy state-type registration ordering. Complete distributed
-    initialization and backend configuration before creating the call.
-    """
-    if not isinstance(payload, bytes) or not payload:
-        raise ValueError("payload must be nonempty bytes")
-    return _ffi_call_from_payload(
-        payload,
-        payload_loader,
-        function_name,
-        result_shape_dtypes,
-        payload_sha256=hashlib.sha256(payload).hexdigest(),
-        platform=platform,
-        arg_spec=arg_spec,
-        workspaces=workspaces,
-        vmap_method=vmap_method,
-        input_layouts=input_layouts,
-        output_layouts=output_layouts,
-        input_output_aliases=input_output_aliases,
-    )
 
 
 def _require_orcjit() -> None:
@@ -344,19 +296,18 @@ def ffi_call_from_object(
     """Build a JAX FFI call backed by an in-memory native object file.
 
     The object bytes are embedded directly in a StableHLO custom-call attribute.
-    At executable instantiation, TVM-FFI ORCJIT loads them from memory. JAX TVM FFI
-    weakly interns the module by object SHA-256 and resolves ``function_name``
-    from it.
+    At custom-call instantiation, TVM-FFI ORCJIT loads them from memory and the
+    bridge resolves ``function_name``. The call state retains the module and
+    function for the executable's lifetime.
     """
     _require_orcjit()
     if not isinstance(object_bytes, bytes) or not object_bytes:
         raise ValueError("object_bytes must be nonempty bytes")
-    return _ffi_call_from_payload(
+    return ffi_call_from_payload(
         object_bytes,
         _ORCJIT_OBJECT_LOADER,
         function_name,
         result_shape_dtypes,
-        payload_sha256=hashlib.sha256(object_bytes).hexdigest(),
         platform=platform,
         arg_spec=arg_spec,
         workspaces=workspaces,
@@ -379,21 +330,18 @@ def ffi_call_from_serialized(
     output_layouts: Sequence[Any] | None = None,
     input_output_aliases: dict[int, int] | None = None,
 ) -> Callable[..., Any]:
-    """Build a JAX FFI call from a prehashed native object.
+    """Build a JAX FFI call from a serialized native object.
 
     This is the preferred launcher for :func:`jax_tvm_ffi.cutlass.compile_to_object`
-    results. It embeds the object in StableHLO like :func:`ffi_call_from_object`,
-    while reusing the immutable digest already stored in ``serialized_function``.
+    results. It passes the object's bytes and exported function name to
+    :func:`ffi_call_from_object`.
     """
     if not isinstance(serialized_function, SerializedFunction):
         raise TypeError("serialized_function must be a SerializedFunction")
-    _require_orcjit()
-    return _ffi_call_from_payload(
+    return ffi_call_from_object(
         serialized_function.object_bytes,
-        _ORCJIT_OBJECT_LOADER,
         serialized_function.function_name,
         result_shape_dtypes,
-        payload_sha256=serialized_function.sha256,
         platform=platform,
         arg_spec=arg_spec,
         workspaces=workspaces,

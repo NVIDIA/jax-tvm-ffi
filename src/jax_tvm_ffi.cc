@@ -14,20 +14,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <type_traits>
-#include <variant>
 #include <vector>
 
 namespace jax_tvm_ffi {
@@ -1112,213 +1108,21 @@ tvm::ffi::Module LoadOrcjitObjectModule(const tvm::ffi::Bytes& object_bytes) {
       .cast<tvm::ffi::Module>();
 }
 
-struct PayloadModuleKey {
-  std::string loader;
-  std::uintptr_t loader_identity;
-  std::string sha256;
-  size_t payload_size;
-
-  bool operator<(const PayloadModuleKey& other) const noexcept {
-    const int loader_order = loader.compare(other.loader);
-    if (loader_order != 0) {
-      return loader_order < 0;
-    }
-    if (loader_identity != other.loader_identity) return loader_identity < other.loader_identity;
-    const int digest_order = sha256.compare(other.sha256);
-    if (digest_order != 0) {
-      return digest_order < 0;
-    }
-    return payload_size < other.payload_size;
+tvm::ffi::Module LoadPayloadModule(std::string_view payload, std::string_view payload_loader) {
+  std::optional<tvm::ffi::Function> loader = tvm::ffi::Function::GetGlobal(payload_loader);
+  if (!loader.has_value()) {
+    throw std::invalid_argument("Payload loader '" + std::string(payload_loader) +
+                                "' is not registered");
   }
-};
-
-enum class PayloadModuleLoadStatus { kLoading, kReady, kFailed };
-
-// XLA instantiate state strongly owns this holder; the process cache owns it weakly.
-struct LoadedPayloadModule {
-  LoadedPayloadModule(tvm::ffi::Function loader, tvm::ffi::Module module)
-      : loader(std::move(loader)), module(std::move(module)) {}
-
-  tvm::ffi::Function loader;
-  tvm::ffi::Module module;
-};
-
-struct PayloadModuleLoadState {
-  explicit PayloadModuleLoadState(tvm::ffi::Function loader)
-      : loader(std::move(loader)), loading_thread(std::this_thread::get_id()) {}
-
-  tvm::ffi::Function loader;
-  std::thread::id loading_thread;
-  PayloadModuleLoadStatus status = PayloadModuleLoadStatus::kLoading;
-  std::shared_ptr<const LoadedPayloadModule> module;
-  std::exception_ptr failure;
-  std::condition_variable ready;
-};
-
-using PayloadModuleEntry =
-    std::variant<std::shared_ptr<PayloadModuleLoadState>, std::weak_ptr<const LoadedPayloadModule>>;
-using PayloadModuleEntries = std::map<PayloadModuleKey, PayloadModuleEntry>;
-
-class PayloadModuleCache {
- public:
-  static PayloadModuleCache& Global() {
-    // In-flight loader functions may own objects from another shared library.
-    // Explicit clearing is safe; process teardown order across DSOs is not.
-    static PayloadModuleCache* cache = new PayloadModuleCache();
-    return *cache;
-  }
-
-  std::shared_ptr<const LoadedPayloadModule> Load(std::string_view payload,
-                                                  std::string_view payload_loader,
-                                                  std::string_view payload_sha256) {
-    std::optional<tvm::ffi::Function> loader = tvm::ffi::Function::GetGlobal(payload_loader);
-    if (!loader.has_value()) {
-      throw std::invalid_argument("Payload loader '" + std::string(payload_loader) +
-                                  "' is not registered");
-    }
-
-    const PayloadModuleKey cache_key{std::string(payload_loader),
-                                     reinterpret_cast<std::uintptr_t>(loader->get()),
-                                     std::string(payload_sha256), payload.size()};
-    std::shared_ptr<PayloadModuleLoadState> state;
-    {
-      std::unique_lock<std::mutex> lock(mutex_);
-      while (true) {
-        auto it = entries_.find(cache_key);
-        if (it == entries_.end()) {
-          PruneExpiredLocked();
-          state = std::make_shared<PayloadModuleLoadState>(*loader);
-          entries_.emplace(cache_key, state);
-          break;
-        }
-
-        if (auto* loading = std::get_if<std::shared_ptr<PayloadModuleLoadState>>(&it->second)) {
-          state = *loading;
-          if (state->loading_thread == std::this_thread::get_id()) {
-            throw std::invalid_argument("Payload loader recursively requested the same payload");
-          }
-          state->ready.wait(lock,
-                            [&] { return state->status != PayloadModuleLoadStatus::kLoading; });
-          if (state->status == PayloadModuleLoadStatus::kFailed) {
-            std::exception_ptr failure = state->failure;
-            lock.unlock();
-            std::rethrow_exception(failure);
-          }
-
-          std::shared_ptr<const LoadedPayloadModule> module = state->module;
-          return module;
-        }
-
-        auto& cached_module = std::get<std::weak_ptr<const LoadedPayloadModule>>(it->second);
-        std::shared_ptr<const LoadedPayloadModule> module = cached_module.lock();
-        if (module != nullptr) {
-          return module;
-        }
-
-        entries_.erase(it);
-        PruneExpiredLocked();
-        state = std::make_shared<PayloadModuleLoadState>(*loader);
-        entries_.emplace(cache_key, state);
-        break;
-      }
-    }
-
-    std::shared_ptr<const LoadedPayloadModule> loaded_module;
-    try {
-      tvm::ffi::Bytes payload_bytes(payload.data(), payload.size());
-      tvm::ffi::Module module = state->loader(payload_bytes).cast<tvm::ffi::Module>();
-      loaded_module = std::make_shared<const LoadedPayloadModule>(state->loader, std::move(module));
-    } catch (...) {
-      PublishFailure(cache_key, state, std::current_exception());
-      throw;
-    }
-    PublishSuccess(cache_key, state, loaded_module);
-    return loaded_module;
-  }
-
-  int64_t Clear() {
-    PayloadModuleEntries released_entries;
-    int64_t entry_count = 0;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      for (const auto& entry : entries_) {
-        const auto* module = std::get_if<std::weak_ptr<const LoadedPayloadModule>>(&entry.second);
-        if (module != nullptr && !module->expired()) {
-          ++entry_count;
-        }
-      }
-      entries_.swap(released_entries);
-    }
-    return entry_count;
-  }
-
- private:
-  void PublishSuccess(const PayloadModuleKey& cache_key,
-                      const std::shared_ptr<PayloadModuleLoadState>& state,
-                      const std::shared_ptr<const LoadedPayloadModule>& module) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      state->module = module;
-      state->loader = tvm::ffi::Function(nullptr);
-      state->status = PayloadModuleLoadStatus::kReady;
-      auto it = entries_.find(cache_key);
-      if (it != entries_.end()) {
-        auto* loading = std::get_if<std::shared_ptr<PayloadModuleLoadState>>(&it->second);
-        if (loading != nullptr && *loading == state) {
-          it->second = std::weak_ptr<const LoadedPayloadModule>(module);
-        }
-      }
-    }
-    state->ready.notify_all();
-  }
-
-  void PublishFailure(const PayloadModuleKey& cache_key,
-                      const std::shared_ptr<PayloadModuleLoadState>& state,
-                      std::exception_ptr failure) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      state->failure = std::move(failure);
-      state->status = PayloadModuleLoadStatus::kFailed;
-      auto it = entries_.find(cache_key);
-      if (it != entries_.end()) {
-        auto* loading = std::get_if<std::shared_ptr<PayloadModuleLoadState>>(&it->second);
-        if (loading != nullptr && *loading == state) {
-          entries_.erase(it);
-        }
-      }
-    }
-    state->ready.notify_all();
-  }
-
-  void PruneExpiredLocked() {
-    for (auto it = entries_.begin(); it != entries_.end();) {
-      auto* module = std::get_if<std::weak_ptr<const LoadedPayloadModule>>(&it->second);
-      if (module != nullptr && module->expired()) {
-        it = entries_.erase(it);
-      } else {
-        ++it;
-      }
-    }
-  }
-
-  std::mutex mutex_;
-  PayloadModuleEntries entries_;
-};
-
-std::shared_ptr<const LoadedPayloadModule> LoadPayloadModule(std::string_view payload,
-                                                             std::string_view payload_loader,
-                                                             std::string_view payload_sha256) {
-  return PayloadModuleCache::Global().Load(payload, payload_loader, payload_sha256);
+  tvm::ffi::Bytes payload_bytes(payload.data(), payload.size());
+  return (*loader)(payload_bytes).cast<tvm::ffi::Module>();
 }
-
-int64_t ClearPayloadModuleCache() { return PayloadModuleCache::Global().Clear(); }
 
 }  // namespace
 
 struct PayloadCallAttributes {
   std::string_view payload;
   std::string_view payload_loader;
-  std::string_view payload_sha256;
   std::string_view function_name;
   std::string_view arg_spec;
   int64_t device_type;
@@ -1331,8 +1135,6 @@ xla::ffi::ErrorOr<PayloadCallAttributes> DecodePayloadCallAttributes(
   if (!payload) return std::move(payload).error();
   auto payload_loader = attrs.get<std::string_view>("payload_loader");
   if (!payload_loader) return std::move(payload_loader).error();
-  auto payload_sha256 = attrs.get<std::string_view>("payload_sha256");
-  if (!payload_sha256) return std::move(payload_sha256).error();
   auto function_name = attrs.get<std::string_view>("function_name");
   if (!function_name) return std::move(function_name).error();
   auto arg_spec = attrs.get<std::string_view>("arg_spec");
@@ -1341,7 +1143,7 @@ xla::ffi::ErrorOr<PayloadCallAttributes> DecodePayloadCallAttributes(
   if (!device_type) return std::move(device_type).error();
   auto num_workspace_outputs = attrs.get<int64_t>("num_workspace_outputs");
   if (!num_workspace_outputs) return std::move(num_workspace_outputs).error();
-  return PayloadCallAttributes{*payload,  *payload_loader, *payload_sha256,       *function_name,
+  return PayloadCallAttributes{*payload,  *payload_loader, *function_name,
                                *arg_spec, *device_type,    *num_workspace_outputs};
 }
 
@@ -1366,11 +1168,11 @@ template <int DeviceType>
 struct PayloadCallState {
   static inline xla::ffi::TypeId id{};
 
-  PayloadCallState(std::shared_ptr<const LoadedPayloadModule> loaded_module,
-                   std::unique_ptr<JAXTVMFFIHandler> handler)
-      : loaded_module(std::move(loaded_module)), handler(std::move(handler)) {}
+  PayloadCallState(tvm::ffi::Module module, std::unique_ptr<JAXTVMFFIHandler> handler)
+      : module(std::move(module)), handler(std::move(handler)) {}
 
-  std::shared_ptr<const LoadedPayloadModule> loaded_module;
+  // Destroy the handler before unloading the module that owns its function.
+  tvm::ffi::Module module;
   std::unique_ptr<JAXTVMFFIHandler> handler;
 };
 
@@ -1387,11 +1189,10 @@ xla::ffi::ErrorOr<std::unique_ptr<PayloadCallState<DeviceType>>> InstantiatePayl
   }
 
   try {
-    std::shared_ptr<const LoadedPayloadModule> loaded_module =
-        LoadPayloadModule(decoded->payload, decoded->payload_loader, decoded->payload_sha256);
+    tvm::ffi::Module module = LoadPayloadModule(decoded->payload, decoded->payload_loader);
     tvm::ffi::String function_name(decoded->function_name.data(), decoded->function_name.size());
     tvm::ffi::Optional<tvm::ffi::Function> function =
-        loaded_module->module->GetFunction(function_name, /*query_imports=*/true);
+        module->GetFunction(function_name, /*query_imports=*/true);
     if (!function.has_value()) {
       throw std::invalid_argument("Payload module does not export TVM FFI function '" +
                                   std::string(decoded->function_name) + "'");
@@ -1402,8 +1203,7 @@ xla::ffi::ErrorOr<std::unique_ptr<PayloadCallState<DeviceType>>> InstantiatePayl
         std::move(*function), std::move(decode_spec), DeviceType,
         /*traits=*/0, /*pass_owned_tensor=*/false,
         /*use_last_output_for_alloc_workspace=*/false, decoded->num_workspace_outputs);
-    return std::make_unique<PayloadCallState<DeviceType>>(std::move(loaded_module),
-                                                          std::move(handler));
+    return std::make_unique<PayloadCallState<DeviceType>>(std::move(module), std::move(handler));
   } catch (const std::invalid_argument& error) {
     return xla::ffi::Error::InvalidArgument("Failed to load payload function '" +
                                             std::string(decoded->function_name) +
@@ -1637,6 +1437,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(payload_call_instantiate_handler, PayloadCallInsta
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(payload_call_execute_handler, PayloadCallExecuteHandler);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(payload_call_state_type_id, PayloadCallStateTypeId);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(payload_call_state_type_info, PayloadCallStateTypeInfo);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(clear_payload_module_cache, ClearPayloadModuleCache);
 
 }  // namespace jax_tvm_ffi

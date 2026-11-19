@@ -42,12 +42,11 @@ preserves the kernel's lazy CUDA initialization and exports
 `__tvm_ffi_module_init` for explicit initialization.
 
 The serialized example uses `cute.compile[EnableTVMFFI]` and serializes the
-compiled handle into a `SerializedFunction` containing the TVM FFI object bytes,
-exported function name, and SHA-256 digest. It embeds the bytes and name in the
-HLO without writing an object file. The installed ORCJIT
-extension loads object bytes through its existing execution-session API. JAX
-TVM FFI caches the loaded module weakly by object SHA-256 and resolves each
-requested function from it. Live JAX executables own the shared module. The
+compiled handle into a `SerializedFunction` containing the TVM FFI object bytes
+and exported function name. It embeds the bytes and name in the HLO without
+writing an object file. The installed ORCJIT extension loads object bytes
+through its existing execution-session API. Each custom-call instantiation
+loads a module and retains it for the executable's lifetime. The
 reusable entry point is `jax_tvm_ffi.cutlass.compile_to_object`. Pass additional
 compiler flags in the `compile_options` string; they are appended after
 the helper's defaults and can override them. The helper always adds

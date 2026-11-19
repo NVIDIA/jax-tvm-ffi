@@ -116,12 +116,11 @@ enable CuTe DSL's transitive development dependencies.
 
 `ffi_call_from_object` embeds raw native object bytes and an entry-point name
 in the StableHLO custom call. At executable instantiation, a shared TVM-FFI
-ORCJIT session loads the object directly from memory. JAX TVM FFI weakly
-interns the resulting module by loader and payload SHA-256, then resolves
-the exported host launcher from that module. Each executable strongly owns the
-shared module, resolved function, and decoded argument mapping for every launch.
-The cache does not extend module lifetime, so a module can unload after its last
-executable and in-flight instantiation owner is destroyed.
+ORCJIT session loads the object directly from memory. Each custom-call
+instantiation loads its own module and resolves the exported host launcher.
+The call state retains the module, function, and decoded argument mapping for
+every launch until the executable is released. Separate call instances load
+independently, including when they use the same object bytes.
 
 The native loader resolves C++ runtime symbols from the consuming process. It
 leaves ORCJIT's optional C++ runtime-library paths unset and does not perform
@@ -132,8 +131,8 @@ platform initializes that JAX backend to satisfy state-type registration
 ordering. Complete `jax.distributed.initialize()` and other backend
 configuration before constructing these calls.
 
-CUTLASS DSL users can obtain CUDA object bytes, an exported name, and a SHA-256
-digest with `jax_tvm_ffi.cutlass.compile_to_object`. The helper uses
+CUTLASS DSL users can obtain CUDA object bytes and an exported name with
+`jax_tvm_ffi.cutlass.compile_to_object`. The helper uses
 `cute.compile[EnableTVMFFI]`, then asks the returned compiled handle for its
 object bytes. CuTe DSL 4.9.0.dev1 includes object dumping and exports
 `__tvm_ffi_module_init` while retaining the kernel's lazy CUDA initialization.
@@ -166,8 +165,7 @@ its embedded device code, such as a CUBIN, plus the explicit
 ORCJIT also accepts the native object format on macOS and Windows.
 `ffi_call_from_payload` remains
 available for other serialized formats through a registered loader with
-signature `(Bytes) -> Module`. Call `clear_payload_module_cache()` to invalidate
-weak lookup entries; live executables keep their modules valid.
+signature `(Bytes) -> Module`.
 
 Workspaces are trailing `uint8` outputs owned by XLA. They are hidden from the
 Python result and passed to the loaded function as opaque pointers after its

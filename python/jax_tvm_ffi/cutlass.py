@@ -64,7 +64,7 @@ def compile_to_object(
             TVM FFI remains enabled.
 
     Returns:
-        The object bytes, exported TVM FFI function name, and SHA-256 digest.
+        The object bytes and exported TVM FFI function name.
 
     Notes:
         This helper enables TVM FFI and serializes the compiled handle with

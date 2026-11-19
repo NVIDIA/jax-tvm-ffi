@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import hashlib
 import sys
 import types
 
@@ -87,7 +86,6 @@ def test_compile_to_object_dumps_tvm_ffi_compiled_handle(fake_cutlass):
         object_bytes=fake_cutlass.object_bytes,
         function_name="softmax",
     )
-    assert result.sha256 == hashlib.sha256(fake_cutlass.object_bytes).hexdigest()
     assert fake_cutlass.calls == [
         ("find_runtime_libraries", False),
         (

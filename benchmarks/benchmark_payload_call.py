@@ -98,36 +98,6 @@ def _benchmark_orcjit_loads(
     )
 
 
-def _benchmark_call_factories(
-    serialized: jax_tvm_ffi.SerializedFunction,
-    result: jax.ShapeDtypeStruct,
-    samples: int,
-) -> tuple[float, float]:
-    object_times = []
-    prehashed_times = []
-    for _ in range(samples):
-        _, duration_ns = _time_ns(
-            lambda: jax_tvm_ffi.ffi_call_from_object(
-                serialized.object_bytes,
-                serialized.function_name,
-                result,
-                platform="cpu",
-                arg_spec=("attrs.increment", "rets", "args"),
-            )
-        )
-        _, prehashed_ns = _time_ns(
-            lambda: jax_tvm_ffi.ffi_call_from_serialized(
-                serialized,
-                result,
-                platform="cpu",
-                arg_spec=("attrs.increment", "rets", "args"),
-            )
-        )
-        object_times.append(duration_ns / 1_000)
-        prehashed_times.append(prehashed_ns / 1_000)
-    return _median(object_times), _median(prehashed_times)
-
-
 def _compile_once(
     call: Callable[..., jax.Array], x: jax.Array, increment: int
 ) -> tuple[Any, float, float]:
@@ -155,38 +125,21 @@ def _benchmark_compilation(
         direct_compile_ms.append(compile_ms)
         del executable
 
-    miss_lower_ms = []
-    miss_compile_ms = []
-    for increment in range(samples, 2 * samples):
-        if jax_tvm_ffi.clear_payload_module_cache() != 0:
-            raise RuntimeError("A payload executable unexpectedly outlived its miss sample")
+    payload_lower_ms = []
+    payload_compile_ms = []
+    for increment in range(samples):
         executable, lower_ms, compile_ms = _compile_once(payload_call, x, increment)
-        miss_lower_ms.append(lower_ms)
-        miss_compile_ms.append(compile_ms)
+        payload_lower_ms.append(lower_ms)
+        payload_compile_ms.append(compile_ms)
         del executable
-        jax.clear_caches()
-        gc.collect()
-
-    jax_tvm_ffi.clear_payload_module_cache()
-    anchor, _, _ = _compile_once(payload_call, x, increment=2 * samples)
-    warm_lower_ms = []
-    warm_compile_ms = []
-    for increment in range(2 * samples + 1, 3 * samples + 1):
-        executable, lower_ms, compile_ms = _compile_once(payload_call, x, increment)
-        warm_lower_ms.append(lower_ms)
-        warm_compile_ms.append(compile_ms)
-        del executable
-    del anchor
     jax.clear_caches()
     gc.collect()
 
     return {
         "direct_lower_ms": _median(direct_lower_ms),
         "direct_compile_ms": _median(direct_compile_ms),
-        "payload_module_miss_lower_ms": _median(miss_lower_ms),
-        "payload_module_miss_compile_ms": _median(miss_compile_ms),
-        "payload_warm_lower_ms": _median(warm_lower_ms),
-        "payload_warm_compile_ms": _median(warm_compile_ms),
+        "payload_lower_ms": _median(payload_lower_ms),
+        "payload_compile_ms": _median(payload_compile_ms),
     }
 
 
@@ -240,11 +193,11 @@ def _benchmark_deserialization(
     client.deserialize_executable(direct_serialized, devices)
     client.deserialize_executable(payload_serialized, devices)
     direct_times = []
-    payload_hit_times = []
+    payload_times = []
     for sample in range(samples):
         operations = (
             (direct_serialized, direct_times),
-            (payload_serialized, payload_hit_times),
+            (payload_serialized, payload_times),
         )
         if sample % 2:
             operations = tuple(reversed(operations))
@@ -255,21 +208,11 @@ def _benchmark_deserialization(
             measurements.append(duration_ns / 1_000)
             del executable
 
-    payload_forced_clear_times = []
-    for _ in range(samples):
-        jax_tvm_ffi.clear_payload_module_cache()
-        executable, duration_ns = _time_ns(
-            lambda: client.deserialize_executable(payload_serialized, devices)
-        )
-        payload_forced_clear_times.append(duration_ns / 1_000)
-        del executable
-
     return {
         "direct_executable_bytes": len(direct_serialized),
         "payload_executable_bytes": len(payload_serialized),
         "direct_deserialize_us": _median(direct_times),
-        "payload_cache_hit_deserialize_us": _median(payload_hit_times),
-        "payload_forced_cache_clear_deserialize_us": _median(payload_forced_clear_times),
+        "payload_deserialize_us": _median(payload_times),
     }
 
 
@@ -324,17 +267,9 @@ def main() -> None:
         )
         result = jax.ShapeDtypeStruct((1,), jnp.float32)
         direct_call = jax.ffi.ffi_call(_DIRECT_TARGET, result)
-        serialized_construction_times = []
-        for _ in range(args.load_samples):
-            serialized, duration_ns = _time_ns(
-                lambda: jax_tvm_ffi.SerializedFunction(object_bytes, _FUNCTION_NAME)
-            )
-            serialized_construction_times.append(duration_ns / 1_000)
-        object_factory_us, prehashed_factory_us = _benchmark_call_factories(
-            serialized, result, args.load_samples
-        )
-        payload_call = jax_tvm_ffi.ffi_call_from_serialized(
-            serialized,
+        payload_call = jax_tvm_ffi.ffi_call_from_object(
+            object_bytes,
+            _FUNCTION_NAME,
             result,
             platform="cpu",
             arg_spec=("attrs.increment", "rets", "args"),
@@ -358,9 +293,6 @@ def main() -> None:
     print(f"platform: {jax.devices('cpu')[0].device_kind}")
     print(f"jax: {jax.__version__}")
     print(f"object_bytes: {len(object_bytes)}")
-    print(f"serialized_function_construct_us: {_median(serialized_construction_times):.3f}")
-    print(f"object_call_factory_us: {object_factory_us:.3f}")
-    print(f"prehashed_call_factory_us: {prehashed_factory_us:.3f}")
     print(f"orcjit_first_module_add_us: {first_load_us:.3f}")
     print(f"orcjit_first_function_materialize_us: {first_lookup_us:.3f}")
     print(f"orcjit_warm_session_fresh_module_add_us: {fresh_load_us:.3f}")
